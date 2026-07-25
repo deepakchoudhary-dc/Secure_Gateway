@@ -123,7 +123,7 @@ class GatewayConfigUpdate(BaseModel):
     @validator("primary_provider", "fallback_provider")
     def validate_provider(cls, value):
         if value not in {"openai", "anthropic", "custom"}:
-            raise ValueError("provider must be one of: openai, anthropic, custom")
+            raise ValueError("provider must be one of: openai, anthropic, custom or compactiable")
         return value
 
     @validator("primary_url")
@@ -665,7 +665,7 @@ async def process_ai_request(
                         })
                 except ProviderError as exc:
                     logger.error("Provider routing failed: %s", exc)
-                    response_text = "Gateway Connection Error: Outbound LLM requests failed."
+                    response_text = "Gateway Connection Error: Outbound LLM requests failed or timed out."
                     action_taken = "blocked_network_error"
                     flagged = True
                     add_trace("model_routing", "failed", {
