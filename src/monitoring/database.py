@@ -134,6 +134,20 @@ class GatewayConfig(Base):
     # Topic limits rail config
     allowed_topics = Column(Text, default="")  # Comma-separated list of allowed topics (e.g., support, account)
 
+class OutboxEvent(Base):
+    __tablename__ = "outbox_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    topic = Column(String(100), nullable=False, index=True)
+    payload_json = Column(Text, nullable=False)
+    status = Column(String(20), nullable=False, default="pending", index=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    available_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    lease_expires_at = Column(DateTime, nullable=True, index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+    last_error = Column(String(500), nullable=True)
+
 class IdempotencyRecord(Base):
     __tablename__ = "idempotency_records"
     __table_args__ = (

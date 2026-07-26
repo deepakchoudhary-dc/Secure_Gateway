@@ -14,6 +14,7 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 from ..config.settings import settings
 from ..monitoring.database import SessionLocal, HITLRequest
+from ..queue.outbox import enqueue_notification
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,13 @@ class HITLManager:
                 created_at=datetime.utcnow()
             )
             session.add(db_request)
+            enqueue_notification(
+                session,
+                recipient=settings.HITL_EMAIL,
+                subject=f"[AI Security Gateway] HITL Review Required: {request_id}",
+                body=f"A request requires human review.\n\nRequest ID: {request_id}\nUser: {fields['user_id']}",
+                metadata={"request_id": request_id, "user_id": fields["user_id"]},
+            )
             session.commit()
             logger.info(f"Created HITL pending request: {request_id}")
         except Exception as e:
@@ -78,8 +86,6 @@ class HITLManager:
         finally:
             session.close()
 
-        # Send notification via dispatcher
-        await self._send_notification(request_id, fields["user_id"], fields["prompt"])
         return HITLApprovalResult({
             "request_id": request_id,
             "status": "pending",
@@ -231,42 +237,6 @@ class HITLManager:
             return False
         finally:
             session.close()
-
-    async def _send_notification(self, request_id: str, user_id: str, prompt: str):
-        """Send notification via the configured dispatcher."""
-        try:
-            from ..queue.notifications import get_notification_dispatcher
-            dispatcher = get_notification_dispatcher()
-            recipient = settings.HITL_EMAIL
-            subject = f"[AI Security Gateway] HITL Review Required: {request_id}"
-            body = (
-                f"A request requires human review.\n\n"
-                f"Request ID: {request_id}\n"
-                f"User: {user_id}\n"
-                f"Prompt preview: {prompt[:200]}...\n\n"
-                f"Approve: POST /api/v1/hitl/approve/{request_id} with {{\"approved\": true}}\n"
-                f"Deny: POST /api/v1/hitl/approve/{request_id} with {{\"approved\": false}}\n"
-            )
-            success = await dispatcher.send(
-                recipient=recipient,
-                subject=subject,
-                body=body,
-                metadata={"request_id": request_id, "user_id": user_id},
-            )
-            # Mark notification as sent
-            if success:
-                session = SessionLocal()
-                try:
-                    db_req = session.query(HITLRequest).filter(HITLRequest.request_id == request_id).first()
-                    if db_req:
-                        db_req.notification_sent = True
-                        session.commit()
-                except Exception:
-                    session.rollback()
-                finally:
-                    session.close()
-        except Exception as exc:
-            logger.error("Notification dispatch failed for %s: %s", request_id, exc)
 
     def get_pending_requests(self) -> Dict[str, Dict]:
         """Get all pending approval requests from DB"""

@@ -4,6 +4,7 @@ A centralized defense layer for securing AI-driven interactions
 """
 
 from contextlib import asynccontextmanager
+import asyncio
 from fastapi import FastAPI
 from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,7 +29,12 @@ async def lifespan(app: FastAPI):
     await wq.ensure_queue_started("hitl_reviews")
     await wq.ensure_queue_started("notifications")
     await wq.start()
+    from .queue.outbox import run_notification_outbox
+    outbox_stop = asyncio.Event()
+    outbox_task = asyncio.create_task(run_notification_outbox(outbox_stop), name="notification-outbox")
     yield
+    outbox_stop.set()
+    await outbox_task
     await wq.stop()
 
 
@@ -90,4 +96,25 @@ async def root():
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "version": "2.0.0"}
+
+
+@app.get("/ready")
+async def readiness_check():
+    """Readiness probe for traffic routing; liveness remains available at /health."""
+    from fastapi import HTTPException, status
+    from sqlalchemy import text
+    from .monitoring.database import SessionLocal, check_migrations_current
+
+    if not check_migrations_current():
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database migrations are not current")
+
+    session = SessionLocal()
+    try:
+        session.execute(text("SELECT 1"))
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database is unavailable") from exc
+    finally:
+        session.close()
+
+    return {"status": "ready", "version": "2.0.0"}
 
