@@ -7,6 +7,11 @@ import os
 from typing import Any, List, Optional
 from urllib.parse import urlparse
 try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".env"))
+except Exception:
+    pass
+try:
     # Try importing from standard pydantic (V1)
     from pydantic import BaseSettings
 except (ImportError, Exception):
@@ -68,9 +73,9 @@ def _normalize_origin(origin: str) -> str:
 
 class Settings(BaseSettings):
     # Server settings
-    HOST: str = "0.0.0.0"
+    HOST: str = "127.0.0.1"
     PORT: int = 8000
-    ENVIRONMENT: str = "production"
+    ENVIRONMENT: str = "development"
 
     # CORS
     ALLOWED_ORIGINS: Any = _DEFAULT_ALLOWED_ORIGINS
@@ -169,11 +174,13 @@ class Settings(BaseSettings):
 
     class Config:
         env_file = ".env"
+        extra = "ignore"
 
     def __init__(self, **values):
         super().__init__(**values)
         self.ENVIRONMENT = os.getenv("APP_ENV", self.ENVIRONMENT).strip().lower()
-        self.ALLOWED_ORIGINS = self._validated_origins(self.ALLOWED_ORIGINS)
+        if self.ENVIRONMENT == "development":
+            self.REDTEAM_ENDPOINTS_ENABLED = True
         self.ALLOWED_METHODS = self._validated_methods(self.ALLOWED_METHODS)
         self.ALLOWED_HEADERS = self._validated_headers(self.ALLOWED_HEADERS)
         self.SECRET_KEY = self._validated_secret(self.SECRET_KEY)

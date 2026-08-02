@@ -30,6 +30,10 @@ class InputFilter:
         r"what\s+are\s+your\s+instructions\?",
         r"repeat\s+everything\s+above",
         r"print\s+the\s+text\s+above",
+        r"(?:previous|past|prior)\s+(?:chats|conversations|queries|sessions|history)",
+        r"(?:private|confidential|secret|internal)\s+(?:info|information|data|details)",
+        r"do\s+you\s+have\s+any\s+(?:private|confidential|secret)",
+        r"tell\s+me\s+the\s+(?:previous|past|prior)\s+(?:chats|conversations|queries)",
         r"subprocess\.(?:Popen|run|call|check_output)",
         r"os\.(?:system|popen|spawn|exec)",
         r"__import__\s*\(\s*['\"](?:os|subprocess|sys|shutil|socket)['\"]\s*\)",
@@ -55,7 +59,8 @@ class InputFilter:
         {"name": "Credentials/Passwords", "regex": r'(?i)(?:api_key|apikey|password|secret|private_key|token|passwd|db_password|database_url)\s*[:=]\s*[\'"]?[^\'"\s]{6,}[\'"]?', "replacement": '/* [REDACTED CREDENTIAL] */'},
         {"name": "AWS Key ID", "regex": r'AKIA[0-9A-Z]{16}', "replacement": '[REDACTED AWS KEY ID]'},
         {"name": "AWS Secret Access Key", "regex": r'(?i)aws_secret_access_key\s*[:=]\s*[A-Za-z0-9/+=]{40}', "replacement": 'aws_secret_access_key=[REDACTED AWS SECRET]'},
-        {"name": "Google Maps API Key", "regex": r'AIza[0-9A-Za-z-_]{35}', "replacement": '[REDACTED GOOGLE KEY]'}
+        {"name": "Google Maps API Key", "regex": r'AIza[0-9A-Za-z-_]{35}', "replacement": '[REDACTED GOOGLE KEY]'},
+        {"name": "Google Gemini AQ Key", "regex": r'AQ\.[A-Za-z0-9_-]{30,}', "replacement": '[REDACTED GEMINI KEY]'}
     ]
 
     def __init__(self):

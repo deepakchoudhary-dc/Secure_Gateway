@@ -29,6 +29,14 @@ class TestMockProvider:
         assert resp.content == "Custom reply"
 
 
+class TestGeminiProvider:
+    def test_gemini_provider_instantiation(self):
+        """GeminiProvider should instantiate cleanly."""
+        from src.providers.gemini_provider import GeminiProvider
+        provider = GeminiProvider(api_key="test-gemini-key")
+        assert provider.name == "gemini"
+
+
 class TestCircuitBreaker:
     def test_starts_closed(self):
         """Circuit breaker should start in CLOSED state."""

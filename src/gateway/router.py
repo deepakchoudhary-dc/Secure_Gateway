@@ -122,22 +122,24 @@ class GatewayConfigUpdate(BaseModel):
 
     @validator("primary_provider", "fallback_provider")
     def validate_provider(cls, value):
-        if value not in {"openai", "anthropic", "custom"}:
-            raise ValueError("provider must be one of: openai, anthropic, custom or compactiable")
+        if value not in {"openai", "anthropic", "gemini", "custom", "mock"}:
+            raise ValueError("provider must be one of: openai, anthropic, gemini, custom, mock")
         return value
 
     @validator("primary_url")
     def validate_primary_url(cls, value, values):
-        if values.get("primary_provider") == "mock":
+        if values.get("primary_provider") in {"mock", "gemini"} and not value:
             return value
-        _validate_outbound_url(value)
+        if value:
+            _validate_outbound_url(value)
         return value
 
     @validator("fallback_url")
     def validate_fallback_url(cls, value, values):
-        if values.get("fallback_provider") == "mock":
+        if values.get("fallback_provider") in {"mock", "gemini"} and not value:
             return value
-        _validate_outbound_url(value)
+        if value:
+            _validate_outbound_url(value)
         return value
 
 

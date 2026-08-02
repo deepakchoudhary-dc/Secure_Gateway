@@ -57,6 +57,8 @@ class EnvSecretsBackend(SecretsBackend):
 
     def get(self, path: str) -> str:
         value = os.environ.get(path)
+        if value is None and hasattr(settings, path):
+            value = getattr(settings, path)
         if value is None:
             raise SecretsError(f"Environment variable {path!r} is not set")
         return value

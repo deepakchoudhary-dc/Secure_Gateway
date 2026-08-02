@@ -36,6 +36,7 @@ SECRET_VALUE_PATTERNS = [
     (re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}"), "[REDACTED OPENAI KEY]"),
     (re.compile(r"gh[pousr]_[A-Za-z0-9_]{30,}"), "[REDACTED GITHUB TOKEN]"),
     (re.compile(r"xox[baprs]-[A-Za-z0-9-]{20,}"), "[REDACTED SLACK TOKEN]"),
+    (re.compile(r"AQ\.[A-Za-z0-9_-]{30,}"), "[REDACTED GEMINI KEY]"),
     (re.compile(r"(?i)\bAuthorization\s*:\s*Bearer\s+[A-Za-z0-9._~+/=-]{20,}"), "Authorization: Bearer [REDACTED]"),
     (re.compile(r"(?i)(?:api_key|apikey|password|secret|private_key|token|passwd|db_password)\s*[:=]\s*['\"]?[^'\"\s]{6,}['\"]?"), "[REDACTED CREDENTIAL]"),
 ]

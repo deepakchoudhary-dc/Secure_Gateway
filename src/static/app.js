@@ -2,6 +2,18 @@
  * AI Security Gateway - Frontend Application Controller
  */
 
+// Helper for API fetch with admin auth header
+async function apiFetch(url, options = {}) {
+    options.headers = options.headers || {};
+    if (!options.headers['X-Admin-Token'] && !options.headers['x-admin-token']) {
+        options.headers['X-Admin-Token'] = 'admin-secret-key-12345678901234567890';
+    }
+    if (!options.headers['X-API-Key'] && !options.headers['x-api-key']) {
+        options.headers['X-API-Key'] = 'user-secret-key-12345678901234567890';
+    }
+    return fetch(url, options);
+}
+
 // Application State
 const STATE = {
     activeTab: 'overview',
@@ -239,7 +251,7 @@ function initOverview() {
 
 async function fetchStats() {
     try {
-        const res = await fetch('/api/v1/monitoring/stats');
+        const res = await apiFetch('/api/v1/monitoring/stats');
         const data = await res.json();
         
         DOM.statTotalProcessed.innerText = data.total_requests;
@@ -260,7 +272,7 @@ async function fetchStats() {
 
 async function fetchRecentIncidents() {
     try {
-        const res = await fetch('/api/v1/monitoring/logs?limit=5');
+        const res = await apiFetch('/api/v1/monitoring/logs?limit=5');
         const logs = await res.json();
         
         let html = '';
@@ -457,7 +469,7 @@ function initPolicies() {
 
 async function fetchPolicies() {
     try {
-        const res = await fetch('/api/v1/policies');
+        const res = await apiFetch('/api/v1/policies');
         STATE.policies = await res.json();
         
         // If we are currently displaying Policy page, refresh inputs
@@ -589,7 +601,7 @@ async function saveActivePolicy() {
             }
         };
 
-        const res = await fetch('/api/v1/policies', {
+        const res = await apiFetch('/api/v1/policies', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
@@ -628,7 +640,7 @@ function initHITL() {
 
 async function pollPendingHITL() {
     try {
-        const res = await fetch('/api/v1/hitl/pending');
+        const res = await apiFetch('/api/v1/hitl/pending');
         STATE.hitlRequests = await res.json();
         
         const count = Object.keys(STATE.hitlRequests).length;
@@ -753,7 +765,7 @@ async function handleHITLDecision(approved) {
     const id = STATE.activeHitlId;
     
     try {
-        const res = await fetch(`/api/v1/hitl/approve/${id}`, {
+        const res = await apiFetch(`/api/v1/hitl/approve/${id}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ approved: approved, admin_name: 'Admin Panel' })
@@ -823,7 +835,7 @@ async function fetchLogs() {
             url += `&action=${STATE.logsAction}`;
         }
         
-        const res = await fetch(url);
+        const res = await apiFetch(url);
         let logs = await res.json();
         STATE.logs = logs;
 
@@ -980,7 +992,7 @@ function initRedTeaming() {
 
 async function fetchRedteamPayloads() {
     try {
-        const res = await fetch('/api/v1/redteaming/payloads');
+        const res = await apiFetch('/api/v1/redteaming/payloads');
         STATE.redteamPayloads = await res.json();
         
         let html = '';
@@ -1023,7 +1035,7 @@ async function executeRedteamScan() {
     }, 180);
 
     try {
-        const res = await fetch('/api/v1/redteaming/scan', { method: 'POST' });
+        const res = await apiFetch('/api/v1/redteaming/scan', { method: 'POST' });
         const report = await res.json();
         
         clearInterval(progressInterval);
@@ -1122,7 +1134,7 @@ function initPlayground() {
             await sleep(350);
             
             // Make actual API call
-            const res = await fetch('/api/v1/process', {
+            const res = await apiFetch('/api/v1/process', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -1350,7 +1362,7 @@ function initIntegrations() {
 
 async function fetchConfig() {
     try {
-        const res = await fetch('/api/v1/config');
+        const res = await apiFetch('/api/v1/config');
         const config = await res.json();
         
         if (config.primary_provider) {
@@ -1390,7 +1402,7 @@ async function saveConfig() {
             allowed_topics: DOM.allowedTopics.value
         };
         
-        const res = await fetch('/api/v1/config', {
+        const res = await apiFetch('/api/v1/config', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)

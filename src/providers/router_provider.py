@@ -22,6 +22,7 @@ from .circuit_breaker import CircuitBreaker, CircuitBreakerOpen
 from .mock_provider import MockProvider
 from .openai_provider import OpenAIProvider
 from .anthropic_provider import AnthropicProvider
+from .gemini_provider import GeminiProvider
 from .retry import RetryBudgetExhausted, retry_with_backoff
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,8 @@ class ProviderRouter:
             return OpenAIProvider(base_url=url, api_key=key, default_model=model)
         if provider_type == "anthropic":
             return AnthropicProvider(base_url=url, api_key=key, default_model=model)
+        if provider_type == "gemini":
+            return GeminiProvider(base_url=url, api_key=key, default_model=model or "gemini-1.5-flash")
         raise ProviderError(f"Unknown provider type: {provider_type}", retryable=False)
 
     def complete(
@@ -92,7 +95,8 @@ class ProviderRouter:
 
         # ── Try primary ───────────────────────────────────────────
         if primary_provider_type != "mock":
-            self._check_egress(primary_url)
+            if primary_url:
+                self._check_egress(primary_url)
 
         primary = self.build_provider(primary_provider_type, primary_url, primary_key, primary_model)
         breaker = self._get_breaker(f"primary:{primary_provider_type}")
@@ -122,7 +126,8 @@ class ProviderRouter:
         logger.warning("Failing over to fallback provider: %s", fallback_provider_type)
 
         if fallback_provider_type != "mock":
-            self._check_egress(fallback_url)
+            if fallback_url:
+                self._check_egress(fallback_url)
 
         fallback = self.build_provider(fallback_provider_type, fallback_url, fallback_key, fallback_model)
         fb_breaker = self._get_breaker(f"fallback:{fallback_provider_type}")

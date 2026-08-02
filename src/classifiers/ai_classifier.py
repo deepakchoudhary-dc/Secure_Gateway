@@ -157,6 +157,8 @@ class AIClassifier:
             (r"tell\s+me\s+how\s+to\s+make\s+a\s+(?:bomb|virus|weapon)", 0.8, "malicious_request"),
             (r"bypass\s+safety\s+filters", 0.5, "bypass_attempt"),
             (r"(?:show|reveal|print|dump)\s+(?:hidden\s+)?(?:developer|system)\s+(?:message|prompt|instructions)", 0.75, "system_prompt_exfiltration"),
+            (r"(?:previous|past|prior)\s+(?:chats|conversations|queries|history)", 0.7, "session_exfiltration_probe"),
+            (r"(?:private|confidential|secret|internal)\s+(?:info|information|data)", 0.7, "private_data_probe"),
             (r"###\s*system|###\s*instruction", 0.35, "structured_hijack")
         ]
 
