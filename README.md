@@ -20,6 +20,9 @@ A production-grade, highly resilient **AI Security Gateway** acting as an active
 
 ---
 
+<img width="1651" height="867" alt="Screenshot 2026-08-02 153543" src="https://github.com/user-attachments/assets/d59971f4-eddc-43f8-acda-fc1d6de3c115" />
+
+
 ## Technology Stack & Architecture
 
 *   **Backend Core**: FastAPI (Asynchronous framework)
