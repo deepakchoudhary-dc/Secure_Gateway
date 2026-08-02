@@ -6,7 +6,17 @@ from src.sandbox.sandbox_manager import SandboxManager
 
 class TestSandboxSafety(unittest.TestCase):
     def setUp(self):
+        from src.config.settings import settings
+        self.orig_exec = settings.SANDBOX_EXECUTION_ENABLED
+        self.orig_runner = settings.SANDBOX_ALLOW_HOST_RUNNER_IN_TESTS
+        settings.SANDBOX_EXECUTION_ENABLED = True
+        settings.SANDBOX_ALLOW_HOST_RUNNER_IN_TESTS = True
         self.sandbox = SandboxManager()
+
+    def tearDown(self):
+        from src.config.settings import settings
+        settings.SANDBOX_EXECUTION_ENABLED = self.orig_exec
+        settings.SANDBOX_ALLOW_HOST_RUNNER_IN_TESTS = self.orig_runner
 
     def test_benign_code(self):
         """Verify that harmless calculations and logic can execute successfully"""

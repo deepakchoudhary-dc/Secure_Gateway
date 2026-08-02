@@ -92,7 +92,7 @@ class IdempotencyService:
         try:
             existing = self._get(session, tenant_id, subject, key_digest)
             if existing is not None:
-                if existing.state == _COMPLETED and self._is_expired(existing, now):
+                if self._is_expired(existing, now):
                     session.delete(existing)
                     session.commit()
                 else:
@@ -207,6 +207,15 @@ class IdempotencyService:
             raise
         finally:
             session.close()
+
+    @staticmethod
+    def _get(session: Any, tenant_id: str, subject: str, key_digest: str) -> Optional[IdempotencyRecord]:
+        return session.query(IdempotencyRecord).filter(
+            IdempotencyRecord.tenant_id == tenant_id,
+            IdempotencyRecord.subject == subject,
+            IdempotencyRecord.endpoint == _ENDPOINT,
+            IdempotencyRecord.key_digest == key_digest,
+        ).first()
 
     @staticmethod
     def _key_digest(key: str) -> str:

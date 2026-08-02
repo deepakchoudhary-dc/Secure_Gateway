@@ -29,6 +29,17 @@ from src.gateway.idempotency import (
 from src.config.settings import settings
 
 
+@pytest.fixture(autouse=True)
+def clean_idempotency_table():
+    session = SessionLocal()
+    try:
+        session.query(IdempotencyRecord).delete()
+        session.commit()
+    finally:
+        session.close()
+    yield
+
+
 @pytest.fixture
 def service():
     return IdempotencyService()
@@ -118,7 +129,7 @@ class TestIdempotencyLifecycle:
                 tenant_id=tenant_id, subject=subject, key=key, request_fingerprint=service.fingerprint(body2)
             )
 
-    def test_in_progress_re-claim_rejected(self, service):
+    def test_in_progress_reclaim_rejected(self, service):
         tenant_id = "tenant_test_3"
         subject = "user_test_3"
         key = "unique-test-key-000000003"

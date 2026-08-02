@@ -5,9 +5,15 @@ Shared pytest fixtures for AI Security Gateway integration tests.
 import os
 import pytest
 
-# Force test database before any imports
+# Force test database and test environment before any imports
+os.environ["APP_ENV"] = "test"
+os.environ["SECRET_KEY"] = "dev-test-secret-key-12345678901234567890"
+os.environ["MOCK_API_KEY"] = "mock-key-for-testing"
 os.environ["DATABASE_URL"] = f"sqlite:///{os.path.join(os.environ.get('TEMP', '.'), 'ai_security_test.db')}"
 os.environ["REQUIRE_AUTH"] = "false"
+os.environ["REQUIRE_ADMIN_AUTH"] = "false"
+os.environ["ADMIN_API_KEY"] = "admin-test-key-12345678901234567890"
+os.environ["API_KEY"] = "user-test-key-12345678901234567890"
 os.environ["AUTH_MODE"] = "api_key"
 os.environ["LOG_FORMAT"] = "text"
 

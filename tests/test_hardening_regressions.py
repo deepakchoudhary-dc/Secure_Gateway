@@ -61,10 +61,15 @@ class TestHardeningRegressions(unittest.TestCase):
         sandbox = SandboxManager()
         code = "\n".join("print('x')" for _ in range(151))
 
-        result = sandbox.execute_code(code)
-
-        self.assertFalse(result["success"])
-        self.assertIn("150 lines", result["error"])
+        from src.config.settings import settings
+        original = settings.SANDBOX_EXECUTION_ENABLED
+        try:
+            settings.SANDBOX_EXECUTION_ENABLED = True
+            result = sandbox.execute_code(code)
+            self.assertFalse(result["success"])
+            self.assertIn("150 lines", result["error"])
+        finally:
+            settings.SANDBOX_EXECUTION_ENABLED = original
 
 
 if __name__ == "__main__":

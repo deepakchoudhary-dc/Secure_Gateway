@@ -77,61 +77,61 @@ class TestProcessEndpoint:
 
 
 class TestMonitoringEndpoints:
-    def test_get_stats(self, client):
+    def test_get_stats(self, client, admin_headers):
         """Stats endpoint should return aggregates."""
-        resp = client.get("/api/v1/monitoring/stats")
+        resp = client.get("/api/v1/monitoring/stats", headers=admin_headers)
         assert resp.status_code == 200
         data = resp.json()
         assert "total_requests" in data
         assert "activity_timeline" in data
 
-    def test_get_logs(self, client):
+    def test_get_logs(self, client, admin_headers):
         """Logs endpoint should return a list."""
-        resp = client.get("/api/v1/monitoring/logs?limit=5")
+        resp = client.get("/api/v1/monitoring/logs?limit=5", headers=admin_headers)
         assert resp.status_code == 200
         assert isinstance(resp.json(), list)
 
-    def test_get_metrics_json(self, client):
+    def test_get_metrics_json(self, client, admin_headers):
         """Metrics endpoint should return JSON."""
-        resp = client.get("/api/v1/monitoring/metrics?format=json")
+        resp = client.get("/api/v1/monitoring/metrics?format=json", headers=admin_headers)
         assert resp.status_code == 200
         data = resp.json()
         assert "requests_total" in data
 
-    def test_get_metrics_prometheus(self, client):
+    def test_get_metrics_prometheus(self, client, admin_headers):
         """Metrics endpoint should return Prometheus text."""
-        resp = client.get("/api/v1/monitoring/metrics?format=prometheus")
+        resp = client.get("/api/v1/monitoring/metrics?format=prometheus", headers=admin_headers)
         assert resp.status_code == 200
         assert "text/plain" in resp.headers.get("content-type", "")
 
-    def test_get_alerts(self, client):
+    def test_get_alerts(self, client, admin_headers):
         """Alerts endpoint should return a list."""
-        resp = client.get("/api/v1/monitoring/alerts")
+        resp = client.get("/api/v1/monitoring/alerts", headers=admin_headers)
         assert resp.status_code == 200
         assert isinstance(resp.json(), list)
 
 
 class TestCircuitBreakers:
-    def test_circuit_breaker_states(self, client):
+    def test_circuit_breaker_states(self, client, admin_headers):
         """Circuit breaker endpoint should return a dict."""
-        resp = client.get("/api/v1/monitoring/circuit-breakers")
+        resp = client.get("/api/v1/monitoring/circuit-breakers", headers=admin_headers)
         assert resp.status_code == 200
         assert isinstance(resp.json(), dict)
 
 
 class TestPolicies:
-    def test_get_policies(self, client):
+    def test_get_policies(self, client, admin_headers):
         """Policies endpoint should return policy config."""
-        resp = client.get("/api/v1/policies")
+        resp = client.get("/api/v1/policies", headers=admin_headers)
         assert resp.status_code == 200
         data = resp.json()
         assert isinstance(data, dict)
 
 
 class TestConfigEndpoints:
-    def test_get_config(self, client):
+    def test_get_config(self, client, admin_headers):
         """Config endpoint should return current config."""
-        resp = client.get("/api/v1/config")
+        resp = client.get("/api/v1/config", headers=admin_headers)
         assert resp.status_code == 200
 
 
