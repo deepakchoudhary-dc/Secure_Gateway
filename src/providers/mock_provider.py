@@ -6,7 +6,7 @@ Returns predictable responses without any network calls.
 
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
 from .base import LLMMessage, LLMProvider, LLMResponse, LLMUsage
 

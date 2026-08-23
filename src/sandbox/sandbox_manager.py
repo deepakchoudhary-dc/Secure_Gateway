@@ -10,7 +10,7 @@ import sys
 import ast
 import signal
 import shlex
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from ..config.settings import settings
 
 logger = logging.getLogger(__name__)

@@ -6,7 +6,7 @@ Input/Output Filter Module - Handles input sanitization, RAG context validation,
 import re
 import logging
 import base64
-from typing import List, Dict
+
 from ..policy.policy_manager import PolicyManager
 
 logger = logging.getLogger(__name__)
@@ -324,31 +324,15 @@ class InputFilter:
 
         return False
 
-    def validate_structure(self, input_text: str) -> Dict:
-        """
-        Assess structural delimiters and risk score
-        """
-        analysis = {
-            "length": len(input_text),
-            "word_count": len(input_text.split()),
-            "has_delimiters": "###" in input_text,
-            "suspicious_keywords": [],
-            "score": 0.0
-        }
 
-        # Check for suspicious keywords
-        suspicious_words = ["hack", "exploit", "bypass", "override", "admin", "root", "leak", "unrestrict"]
-        for word in suspicious_words:
-            if word.lower() in input_text.lower():
-                analysis["suspicious_keywords"].append(word)
+# Cached instance so /process doesn't recompile 30+ regexes per request.
+# Invalidates whenever the policy cache reloads (policy edits call _clear_cache).
+_cached_filter = {"stamp": None, "inst": None}
 
-        # Calculate score
-        score = 0.0
-        if analysis["length"] > 5000:
-            score += 0.25
-        if not analysis["has_delimiters"]:
-            score += 0.1
-        score += len(analysis["suspicious_keywords"]) * 0.15
 
-        analysis["score"] = min(max(score, 0.0), 1.0)
-        return analysis
+def get_input_filter() -> InputFilter:
+    stamp = PolicyManager._cache_loaded_at
+    if _cached_filter["inst"] is None or _cached_filter["stamp"] != stamp:
+        _cached_filter["inst"] = InputFilter()
+        _cached_filter["stamp"] = stamp
+    return _cached_filter["inst"]

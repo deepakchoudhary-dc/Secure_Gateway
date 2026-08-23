@@ -9,9 +9,8 @@ os.environ.setdefault("LOG_FORMAT", "text")
 from src.monitoring.database import init_db
 init_db()
 
-import pytest
-from src.monitoring.database import engine, Base, SessionLocal, check_migrations_current
-from src.monitoring.database import SecurityLog, HITLRequest, PolicyConfig, GatewayConfig
+from src.monitoring.database import engine, SessionLocal, check_migrations_current
+from src.monitoring.database import SecurityLog
 
 
 class TestSchemaIntegrity:
@@ -26,10 +25,7 @@ class TestSchemaIntegrity:
             "hitl_requests",
             "policy_configs",
             "gateway_configs",
-            "tenants",
-            "tenant_users",
             "secret_access_logs",
-            "notification_logs",
             "redteam_reports",
         ]
         for table in expected:

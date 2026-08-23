@@ -8,9 +8,8 @@ import asyncio
 from fastapi import FastAPI
 from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
-import logging
 from .gateway.router import router as gateway_router
-from .monitoring.logger import setup_logging, set_request_id, get_request_id
+from .monitoring.logger import setup_logging, set_request_id
 from .config.settings import settings
 
 # Setup logging
@@ -23,19 +22,13 @@ init_db()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup/shutdown lifecycle for work queue."""
-    from .queue.work_queue import get_work_queue
-    wq = get_work_queue()
-    await wq.ensure_queue_started("hitl_reviews")
-    await wq.ensure_queue_started("notifications")
-    await wq.start()
+    """Startup/shutdown lifecycle for the notification outbox."""
     from .queue.outbox import run_notification_outbox
     outbox_stop = asyncio.Event()
     outbox_task = asyncio.create_task(run_notification_outbox(outbox_stop), name="notification-outbox")
     yield
     outbox_stop.set()
     await outbox_task
-    await wq.stop()
 
 
 app = FastAPI(
@@ -62,6 +55,16 @@ async def request_id_middleware(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-Request-ID"] = request_id
     return response
+
+@app.middleware("http")
+async def limit_body_size(request: Request, call_next):
+    """Reject oversized request bodies before they are buffered."""
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > settings.MAX_BODY_BYTES:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=413, content={"detail": "Request body too large"})
+    # ponytail: Content-Length header only; chunked bodies are not measured — cap at the reverse proxy
+    return await call_next(request)
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):

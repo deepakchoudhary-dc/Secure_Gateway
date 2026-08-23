@@ -188,26 +188,6 @@ class IdempotencyService:
         finally:
             session.close()
 
-    def cleanup_expired_completed(self, *, batch_size: int = 500) -> int:
-        """Delete expired terminal records without erasing unknown in-progress work."""
-        if not isinstance(batch_size, int) or not 1 <= batch_size <= 10_000:
-            raise ValueError("batch_size must be between 1 and 10000")
-        session = SessionLocal()
-        try:
-            records = session.query(IdempotencyRecord).filter(
-                IdempotencyRecord.state == _COMPLETED,
-                IdempotencyRecord.expires_at <= datetime.utcnow(),
-            ).order_by(IdempotencyRecord.expires_at.asc()).limit(batch_size).all()
-            for record in records:
-                session.delete(record)
-            session.commit()
-            return len(records)
-        except Exception:
-            session.rollback()
-            raise
-        finally:
-            session.close()
-
     @staticmethod
     def _get(session: Any, tenant_id: str, subject: str, key_digest: str) -> Optional[IdempotencyRecord]:
         return session.query(IdempotencyRecord).filter(

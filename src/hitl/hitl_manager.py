@@ -10,40 +10,34 @@ Enhanced with:
 
 import asyncio
 import logging
+import uuid
 from typing import Dict, Any, List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime
 from ..config.settings import settings
 from ..monitoring.database import SessionLocal, HITLRequest
-from ..queue.outbox import enqueue_notification
+from ..queue.outbox import enqueue_notification, enqueue_webhook
+from ..classifiers.feedback_model import record_feedback
 
 logger = logging.getLogger(__name__)
-
-
-class HITLApprovalResult(dict):
-    """Structured HITL result with safe truthiness for legacy bool callers."""
-
-    def __bool__(self) -> bool:
-        return self.get("status") == "approved"
 
 
 class HITLManager:
     def __init__(self):
         self.approval_timeout = settings.HITL_APPROVAL_TIMEOUT_SECONDS
-        self.expiry_hours = getattr(settings, "HITL_EXPIRY_HOURS", 24)
 
-    async def create_request(self, request_data: Any) -> HITLApprovalResult:
+    async def create_request(self, request_data: Any) -> Dict[str, Any]:
         """
         Create a human approval request and return immediately.
         """
         if not settings.HITL_ENABLED:
-            return HITLApprovalResult({
+            return {
                 "request_id": None,
                 "status": "approved",
                 "approved": True,
                 "blocking": False,
                 "created": False,
                 "reason": "HITL is disabled"
-            })
+            }
 
         request_id = self._generate_request_id()
         fields = self._extract_request_fields(request_data)
@@ -60,6 +54,8 @@ class HITLManager:
                 user_id=fields["user_id"],
                 status="pending",
                 notification_sent=False,
+                callback_url=fields.get("callback_url"),
+                resume_on_approval=fields.get("resume_on_approval", False),
                 created_at=datetime.utcnow()
             )
             session.add(db_request)
@@ -75,26 +71,26 @@ class HITLManager:
         except Exception as e:
             session.rollback()
             logger.error(f"Failed to save HITL request: {e}")
-            return HITLApprovalResult({
+            return {
                 "request_id": request_id,
                 "status": "error",
                 "approved": False,
                 "blocking": False,
                 "created": False,
                 "error": "failed_to_create_hitl_request"
-            })
+            }
         finally:
             session.close()
 
-        return HITLApprovalResult({
+        return {
             "request_id": request_id,
             "status": "pending",
             "approved": False,
             "blocking": False,
             "created": True
-        })
+            }
 
-    async def request_approval(self, request_data: Any) -> HITLApprovalResult:
+    async def request_approval(self, request_data: Any) -> Dict[str, Any]:
         """
         Request human approval for high-risk requests.
 
@@ -114,7 +110,7 @@ class HITLManager:
         """
         return bool(await self._request_approval_blocking_result(request_data))
 
-    async def _request_approval_blocking_result(self, request_data: Any) -> HITLApprovalResult:
+    async def _request_approval_blocking_result(self, request_data: Any) -> Dict[str, Any]:
         """Create a HITL request and block until a decision or timeout."""
         created = await self.create_request(request_data)
         if created.get("status") != "pending":
@@ -128,25 +124,25 @@ class HITLManager:
                 self._wait_for_approval(request_id),
                 timeout=self.approval_timeout
             )
-            return HITLApprovalResult({
+            return {
                 "request_id": request_id,
                 "status": "approved" if approved else "denied",
                 "approved": approved,
                 "blocking": True,
                 "created": True
-            })
+            }
         except asyncio.TimeoutError:
             logger.warning(f"Approval timeout for request {request_id}")
             self._mark_timeout(request_id)
-            return HITLApprovalResult({
+            return {
                 "request_id": request_id,
                 "status": "timeout",
                 "approved": False,
                 "blocking": True,
                 "created": True
-            })
+            }
 
-    def _extract_request_fields(self, request_data: Any) -> Dict[str, str]:
+    def _extract_request_fields(self, request_data: Any) -> Dict[str, Any]:
         """Normalize dict and pydantic-style request objects into audit fields."""
         def field(name: str, default: str = "") -> str:
             if isinstance(request_data, dict):
@@ -155,13 +151,20 @@ class HITLManager:
                 value = getattr(request_data, name, default)
             return value if value is not None else default
 
+        def opt(name: str):
+            if isinstance(request_data, dict):
+                return request_data.get(name)
+            return getattr(request_data, name, None)
+
         return {
             "prompt": field("prompt"),
             "system_prompt": field("system_prompt"),
             "retrieved_context": field("retrieved_context"),
             "context": field("context"),
             "model": field("model", "unknown"),
-            "user_id": field("user_id", "unknown")
+            "user_id": field("user_id", "unknown"),
+            "callback_url": opt("callback_url"),
+            "resume_on_approval": bool(opt("resume_on_approval")),
         }
 
     def _mark_timeout(self, request_id: str):
@@ -180,8 +183,8 @@ class HITLManager:
             db_session.close()
 
     def _generate_request_id(self) -> str:
-        """Generate unique request ID"""
-        return f"hitl_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
+        """Generate unguessable request ID"""
+        return f"hitl_{uuid.uuid4().hex}"
 
     async def _wait_for_approval(self, request_id: str) -> bool:
         """Wait for human approval by polling the SQLite database"""
@@ -201,24 +204,93 @@ class HITLManager:
                 session.close()
 
     async def approve_request(self, request_id: str, approved: bool, admin_name: str = "Admin") -> bool:
-        """Approve or deny a request in the database"""
+        """Approve or deny a pending request.
+
+        Closes the loop: records a labeled sample for the learning system,
+        enqueues a durable webhook with the decision (if callback_url set),
+        and schedules automatic execution when resume_on_approval was requested.
+        """
         session = SessionLocal()
         try:
             db_req = session.query(HITLRequest).filter(HITLRequest.request_id == request_id).first()
-            if db_req and db_req.status == "pending":
-                db_req.status = "approved" if approved else "denied"
-                db_req.decision_by = admin_name
-                db_req.decision_at = datetime.utcnow()
-                session.commit()
-                logger.info(f"Request {request_id} manually {'approved' if approved else 'denied'} by {admin_name}")
-                return True
-            return False
+            if not (db_req and db_req.status == "pending"):
+                return False
+
+            snapshot = {
+                "request_id": db_req.request_id,
+                "prompt": db_req.prompt,
+                "system_prompt": db_req.system_prompt,
+                "retrieved_context": db_req.retrieved_context,
+                "model": db_req.model or "unknown",
+                "user_id": db_req.user_id or "unknown",
+                "tenant_id": db_req.tenant_id,
+                "callback_url": db_req.callback_url,
+                "resume_on_approval": bool(db_req.resume_on_approval),
+            }
+
+            db_req.status = "approved" if approved else "denied"
+            db_req.decision_by = admin_name
+            db_req.decision_at = datetime.utcnow()
+
+            # Learning loop: the human decision is a labeled sample.
+            record_feedback(
+                source="hitl_denied" if not approved else "hitl_approved",
+                label="malicious" if not approved else "benign",
+                prompt=db_req.prompt,
+                tenant_id=db_req.tenant_id,
+            )
+
+            # Durable decision webhook via the notification outbox.
+            if snapshot["callback_url"]:
+                enqueue_webhook(session, snapshot["callback_url"], {
+                    "type": "hitl_decision",
+                    "request_id": request_id,
+                    "approved": approved,
+                    "decision_by": admin_name,
+                    "decided_at": datetime.utcnow().isoformat(),
+                })
+
+            session.commit()
+            logger.info(f"Request {request_id} manually {'approved' if approved else 'denied'} by {admin_name}")
         except Exception as e:
             session.rollback()
             logger.error(f"Failed to approve request {request_id}: {e}")
             return False
         finally:
             session.close()
+
+        # Auto-execute approved prompts that asked for resume (after commit).
+        if approved and snapshot["resume_on_approval"] and snapshot["callback_url"]:
+            asyncio.create_task(self._resume_and_notify(snapshot))
+        return True
+
+    async def _resume_and_notify(self, snap: Dict[str, Any]) -> None:
+        """Re-run an approved request through the gateway and POST the result.
+
+        ponytail: best-effort in-process task — a crash between approval and
+        resume loses the run (decision webhook is still durable); upgrade path
+        is persisting resume jobs in the outbox table itself.
+        """
+        try:
+            from ..gateway.router import AIRequest, process_ai_request_impl  # local: circular import
+            from ..auth.tenant import CurrentUser
+
+            req = AIRequest(
+                prompt=snap["prompt"],
+                system_prompt=snap["system_prompt"],
+                retrieved_context=snap["retrieved_context"],
+                model=snap["model"],
+                user_id=snap["user_id"],
+            )
+            user = CurrentUser(subject=snap["user_id"], tenant_id=snap["tenant_id"] or "default", roles=["user"])
+            response = await process_ai_request_impl(req, current_user=user, hitl_exempt=True)
+            enqueue_webhook(None, snap["callback_url"], {
+                "type": "hitl_result",
+                "request_id": snap["request_id"],
+                "response": response.dict(),
+            })
+        except Exception as exc:
+            logger.error("HITL resume failed for %s: %s", snap.get("request_id"), exc)
 
     def assign_reviewer(self, request_id: str, reviewer: str) -> bool:
         """Assign a reviewer to a pending request."""
@@ -318,46 +390,3 @@ class HITLManager:
         finally:
             session.close()
 
-    def expire_stale_requests(self) -> int:
-        """Expire pending requests older than HITL_EXPIRY_HOURS.  Returns count expired."""
-        cutoff = datetime.utcnow() - timedelta(hours=self.expiry_hours)
-        session = SessionLocal()
-        try:
-            stale = session.query(HITLRequest).filter(
-                HITLRequest.status == "pending",
-                HITLRequest.created_at < cutoff,
-            ).all()
-            count = 0
-            for req in stale:
-                req.status = "timeout"
-                req.decision_at = datetime.utcnow()
-                req.escalated_at = datetime.utcnow()
-                count += 1
-            if count:
-                session.commit()
-                logger.warning("Expired %d stale HITL requests older than %d hours", count, self.expiry_hours)
-            return count
-        except Exception as e:
-            session.rollback()
-            logger.error("Error expiring stale HITL requests: %s", e)
-            return 0
-        finally:
-            session.close()
-
-    def cleanup_old_requests(self):
-        """Clean up old completed requests from DB"""
-        cutoff_time = datetime.utcnow() - timedelta(hours=24)
-        session = SessionLocal()
-        try:
-            deleted = session.query(HITLRequest).filter(
-                HITLRequest.status != "pending",
-                HITLRequest.created_at < cutoff_time
-            ).delete()
-            session.commit()
-            if deleted:
-                logger.info(f"Cleaned up {deleted} old HITL requests from DB")
-        except Exception as e:
-            session.rollback()
-            logger.error(f"Error cleaning up old HITL requests: {e}")
-        finally:
-            session.close()

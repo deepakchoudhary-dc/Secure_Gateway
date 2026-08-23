@@ -1,7 +1,7 @@
 """
 Secrets management abstraction for the AI Security Gateway.
 
-Provides a uniform interface for storing, retrieving, and rotating secrets
+Provides a uniform interface for storing and retrieving secrets
 regardless of the backend (environment variables, HashiCorp Vault, etc.).
 
 Secrets are stored in the database as *references* (e.g. ``env://OPENAI_KEY``
@@ -13,8 +13,7 @@ import hashlib
 import logging
 import os
 import re
-import time
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 
 from ..config.settings import settings
 
@@ -39,14 +38,6 @@ class SecretsBackend(abc.ABC):
     def store(self, path: str, value: str) -> str:
         """Persist *value* and return the canonical reference string."""
 
-    @abc.abstractmethod
-    def rotate(self, path: str, new_value: str) -> str:
-        """Replace the secret at *path* with *new_value*."""
-
-    @abc.abstractmethod
-    def delete(self, path: str) -> None:
-        """Delete the secret at *path*."""
-
 
 # ── Environment-variable backend (dev / staging) ──────────────────────
 class EnvSecretsBackend(SecretsBackend):
@@ -66,12 +57,6 @@ class EnvSecretsBackend(SecretsBackend):
     def store(self, path: str, value: str) -> str:
         os.environ[path] = value
         return f"env://{path}"
-
-    def rotate(self, path: str, new_value: str) -> str:
-        return self.store(path, new_value)
-
-    def delete(self, path: str) -> None:
-        os.environ.pop(path, None)
 
 
 # ── HashiCorp Vault backend (production) ──────────────────────────────
@@ -138,41 +123,6 @@ class VaultSecretsBackend(SecretsBackend):
             raise SecretsError(f"Vault write failed for {path}: {exc}") from exc
         return f"vault://{mount}/{secret_path}#{field}"
 
-    def rotate(self, path: str, new_value: str) -> str:
-        return self.store(path, new_value)
-
-    def delete(self, path: str) -> None:
-        mount, secret_path, _ = self._parse_path(path)
-        try:
-            self._client.secrets.kv.v2.delete_metadata_and_all_versions(
-                mount_point=mount, path=secret_path,
-            )
-        except Exception as exc:
-            logger.error("Vault delete failed for %s: %s", path, exc)
-
-
-# ── In-memory backend (tests) ────────────────────────────────────────
-class InMemorySecretsBackend(SecretsBackend):
-    """Thread-safe in-memory store for unit tests."""
-
-    def __init__(self):
-        self._store: Dict[str, str] = {}
-
-    def get(self, path: str) -> str:
-        if path not in self._store:
-            raise SecretsError(f"Secret {path!r} not found")
-        return self._store[path]
-
-    def store(self, path: str, value: str) -> str:
-        self._store[path] = value
-        return f"mem://{path}"
-
-    def rotate(self, path: str, new_value: str) -> str:
-        return self.store(path, new_value)
-
-    def delete(self, path: str) -> None:
-        self._store.pop(path, None)
-
 
 # ── Facade ─────────────────────────────────────────────────────────────
 class SecretsManager:
@@ -229,17 +179,6 @@ class SecretsManager:
             log_secret_access("store", ref, actor=actor, tenant_id=tenant_id)
         except Exception as exc:
             logger.error("Failed to log secret storage: %s", exc)
-        return ref
-
-    def rotate_secret(self, reference: str, new_value: str, actor: Optional[str] = None, tenant_id: Optional[str] = None) -> str:
-        """Replace the secret behind a reference with a new value."""
-        backend, path = self._resolve_backend(reference)
-        ref = backend.rotate(path, new_value)
-        try:
-            from .audit_trail import log_secret_access
-            log_secret_access("rotate", ref, actor=actor, tenant_id=tenant_id)
-        except Exception as exc:
-            logger.error("Failed to log secret rotation: %s", exc)
         return ref
 
     def is_reference(self, value: str) -> bool:

@@ -19,11 +19,13 @@ from src.config.settings import settings
 from src.monitoring.database import Base
 
 # Import all models so metadata is populated
-from src.monitoring.database import SecurityLog, HITLRequest, PolicyConfig, GatewayConfig
-from src.auth.tenant import Tenant, TenantUser
+from src.monitoring.database import (
+    SecurityLog, HITLRequest, PolicyConfig, GatewayConfig,
+    OutboxEvent, IdempotencyRecord,
+)
 from src.secrets.audit_trail import SecretAccessLog
-from src.queue.notifications import NotificationLog
 from src.redteaming.report_model import RedTeamReport
+from src.classifiers.feedback_model import DetectionFeedback
 
 config = context.config
 

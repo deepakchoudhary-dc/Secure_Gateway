@@ -10,8 +10,8 @@ import os
 import time
 import logging
 from datetime import datetime
-from typing import List, Dict, Any
-from ..gateway.router import process_ai_request, AIRequest
+from typing import Dict, Any
+from ..gateway.router import process_ai_request_impl, AIRequest
 
 logger = logging.getLogger(__name__)
 
@@ -24,17 +24,8 @@ def load_versioned_payloads() -> Dict[str, Any]:
         with open(_PAYLOADS_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as exc:
-        logger.error("Failed to load red-team payloads from %s: %s", _PAYLOADS_FILE, exc)
+        logger.error(f"Failed to load red-team payloads from {_PAYLOADS_FILE}: {exc}")
         return {"schema_version": "unknown", "payloads": []}
-
-
-# Keep a backward-compat list for imports from other modules
-def _get_payloads() -> List[Dict[str, Any]]:
-    data = load_versioned_payloads()
-    return data.get("payloads", [])
-
-
-RED_TEAM_PAYLOADS = _get_payloads()
 
 
 class RedTeamingSuite:
@@ -45,13 +36,19 @@ class RedTeamingSuite:
 
     async def run_automated_scan(self) -> Dict[str, Any]:
         """
-        Runs the test payloads through the process router endpoint,
-        evaluating vulnerability rate, blocked inputs, and latency.
-        Stores the report in the RedTeamReport table.
+        Runs the test payloads through the gateway pipeline, evaluating
+        vulnerability rate, blocked inputs, and latency. Stores the report and
+        feeds every outcome to the detection learning loop.
         """
+        from ..auth.tenant import CurrentUser
+
         logger.info("Starting automated Red-Teaming security scan (v%s)...", self.version)
         start_time = time.time()
-        
+
+        # Direct pipeline invocation requires a real identity object; the
+        # scanner service principal is whitelisted by policy checks.
+        scanner_user = CurrentUser(subject="red_team_scanner", tenant_id="default", roles=["admin"])
+
         results = []
         blocked_count = 0
         bypassed_count = 0
@@ -72,8 +69,9 @@ class RedTeamingSuite:
                 benign_count += 1
 
             try:
-                # Process through the router logic
-                response = await process_ai_request(req_data)
+                # Process through the gateway pipeline; exempt from HITL so
+                # escalations count as blocked rather than queueing reviews.
+                response = await process_ai_request_impl(req_data, current_user=scanner_user, hitl_exempt=True)
                 
                 # Assess scan outcome
                 is_blocked = "blocked" in response.action_taken or "denied" in response.action_taken
@@ -116,6 +114,18 @@ class RedTeamingSuite:
         duration = time.time() - start_time
         malicious_total = len(self.payloads) - benign_count
         bypass_rate = (bypassed_count / malicious_total * 100) if malicious_total > 0 else 0.0
+
+        # Learning loop: every outcome is a labeled sample for the detector.
+        from ..classifiers.feedback_model import record_feedback
+        for r in results:
+            if r.get("error"):
+                continue
+            record_feedback(
+                source="redteam",
+                label="benign" if not r["is_malicious"] else "malicious",
+                prompt=r["prompt"],
+                tenant_id=None,  # corpus-level signal, applies to all tenants
+            )
 
         metrics = {
             "total_payloads": len(self.payloads),

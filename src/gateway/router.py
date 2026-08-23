@@ -2,13 +2,11 @@
 Gateway Router - Core API endpoints for AI Security Gateway
 """
 
+import asyncio
 import time
 import logging
 import re
 import json
-import uuid
-import ipaddress
-import socket
 import secrets
 from urllib.parse import urlparse
 from fastapi import APIRouter, HTTPException, Depends, Header, status, Response
@@ -17,11 +15,12 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
 from sqlalchemy import text
 
-from ..filters.input_filter import InputFilter
+from ..filters.input_filter import get_input_filter
 from ..classifiers.ai_classifier import AIClassifier
-from ..classifiers.semantic_detector import SemanticDetector
+from ..classifiers.semantic_detector import get_fitted_detector
+from ..classifiers.feedback_model import get_learned_malicious_prompts, get_feedback_epoch
 from ..monitoring.logger import log_transaction, detect_anomaly, set_request_id, get_request_id
-from ..monitoring.database import SessionLocal, SecurityLog, HITLRequest, PolicyConfig, GatewayConfig
+from ..monitoring.database import SessionLocal, SecurityLog, HITLRequest, GatewayConfig
 from ..monitoring.metrics import get_metrics
 from ..monitoring.incident_export import export_incident
 from ..policy.policy_manager import PolicyManager
@@ -29,10 +28,10 @@ from ..hitl.hitl_manager import HITLManager
 from ..sandbox.sandbox_manager import SandboxManager
 from ..config.settings import settings
 from ..auth.tenant import CurrentUser, get_current_user
-from ..auth.rbac import require_role, require_admin, require_reviewer, require_auditor
+from ..auth.rbac import require_role
 from ..auth.jwt_auth import create_access_token, TokenError
 from ..providers.base import LLMMessage, ProviderError
-from ..providers.router_provider import ProviderRouter
+from ..providers.router_provider import ProviderRouter, assert_https_public_host
 from ..secrets.secrets_manager import get_secrets_manager
 from .idempotency import (
     IdempotencyService,
@@ -69,9 +68,30 @@ class AIRequest(BaseModel):
     system_prompt: Optional[str] = Field(None, max_length=4000)
     retrieved_context: Optional[str] = Field(None, max_length=20000)
     user_id: Optional[str] = Field(None, min_length=1, max_length=100)
+    # Free-form client context. Consumed by the HITL review dashboard
+    # (static/app.js renders req.context); distinct from retrieved_context.
     context: Optional[str] = Field(None, max_length=10000)
     model: Optional[str] = Field("gpt-3.5-turbo", min_length=1, max_length=100)
     execute_code: Optional[bool] = False
+    # HITL closed loop: where the decision/result should be POSTed when the
+    # request is escalated to human review.
+    callback_url: Optional[str] = Field(None, max_length=500)
+    resume_on_approval: Optional[bool] = False
+
+    @validator("callback_url")
+    def validate_callback_url(cls, value):
+        if value is None:
+            return value
+        parsed = urlparse(value)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError("callback_url must be an absolute http(s) URL")
+        return value
+
+    @validator("resume_on_approval")
+    def validate_resume(cls, value, values):
+        if value and not values.get("callback_url"):
+            raise ValueError("resume_on_approval requires callback_url")
+        return value
 
     @validator("user_id")
     def validate_user_id(cls, value):
@@ -182,13 +202,6 @@ def require_admin_api_key(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin authentication required")
 
 
-def _get_auth_dependency():
-    """Return the appropriate auth dependency based on AUTH_MODE."""
-    if getattr(settings, "AUTH_MODE", "api_key") == "jwt":
-        return Depends(get_current_user)
-    return Depends(require_user_api_key)
-
-
 def _get_admin_dependency():
     """Return the appropriate admin auth dependency based on AUTH_MODE."""
     if getattr(settings, "AUTH_MODE", "api_key") == "jwt":
@@ -197,22 +210,10 @@ def _get_admin_dependency():
 
 
 def _validate_outbound_url(url: str):
-    parsed = urlparse(url or "")
-    if parsed.scheme != "https" or not parsed.hostname:
-        raise ValueError("Outbound model URL must be HTTPS with a hostname")
-
+    """Config-time URL check; the same egress rules are re-enforced at dispatch time."""
     if settings.ALLOW_PRIVATE_MODEL_URLS:
         return
-
-    try:
-        addresses = socket.getaddrinfo(parsed.hostname, None)
-    except socket.gaierror as ex:
-        raise ValueError(f"Cannot resolve outbound model hostname: {parsed.hostname}") from ex
-
-    for address in addresses:
-        ip = ipaddress.ip_address(address[4][0])
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
-            raise ValueError("Outbound model URL resolves to a non-public network address")
+    assert_https_public_host(url)
 
 # Helper function to extract python code block from a prompt
 def extract_python_code(text: str) -> Optional[str]:
@@ -229,7 +230,28 @@ async def process_ai_request(
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ):
     """
-    Process an AI request through the security gateway
+    Process an AI request through the security gateway.
+
+    HTTP entry point only — internal callers (HITL resume, red-team scanner)
+    use ``process_ai_request_impl`` directly.
+    """
+    return await process_ai_request_impl(
+        request=request,
+        current_user=current_user,
+        idempotency_key=idempotency_key,
+    )
+
+
+async def process_ai_request_impl(
+    request: AIRequest,
+    current_user: CurrentUser,
+    idempotency_key: Optional[str] = None,
+    hitl_exempt: bool = False,
+):
+    """
+    Core gateway pipeline. ``hitl_exempt`` marks flows already cleared by a
+    human reviewer (HITL resume, scanner) so they block instead of
+    re-escalating into an approval loop.
     """
     if not isinstance(current_user, CurrentUser):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Authenticated principal is required")
@@ -273,6 +295,7 @@ async def process_ai_request(
     response_text = ""
     anomalies_list = []
     trace_events: List[Dict[str, Any]] = []
+    usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
     def add_trace(stage: str, status: str, details: Dict[str, Any]):
         trace_events.append({
@@ -310,7 +333,10 @@ async def process_ai_request(
             system_prompt=request.system_prompt,
             retrieved_context=request.retrieved_context,
             trace=trace_events,
-            tenant_id=tenant_id
+            tenant_id=tenant_id,
+            prompt_tokens=usage_totals["prompt_tokens"],
+            completion_tokens=usage_totals["completion_tokens"],
+            total_tokens=usage_totals["total_tokens"],
         )
         resp = AIResponse(
             response=response_text,
@@ -368,7 +394,7 @@ async def process_ai_request(
         })
 
         # Step 0B: User Access & Model Restriction Check
-        access_result = policy_manager.check_user_access(request.user_id, request.model)
+        access_result = policy_manager.check_user_access(request.user_id, request.model, current_user.roles)
         if not access_result.get("allowed", True):
             action_taken = "blocked_access_violation"
             flagged = True
@@ -388,7 +414,21 @@ async def process_ai_request(
             "user_id": request.user_id
         })
 
-        input_filter = InputFilter()
+        # Step 0C: Daily token budget for this tenant (0 = unlimited)
+        daily_token_limit = getattr(settings, "TENANT_DAILY_TOKEN_LIMIT", 0)
+        if daily_token_limit > 0:
+            budget_result = await asyncio.to_thread(
+                policy_manager.check_token_budget, tenant_id, daily_token_limit
+            )
+            if not budget_result.get("allowed", True):
+                action_taken = "blocked_token_budget"
+                flagged = True
+                security_score = 0.4
+                response_text = budget_result.get("reason", "Blocked: token budget exceeded.")
+                add_trace("token_budget", "blocked", {"reason": response_text})
+                return finalize_response()
+
+        input_filter = get_input_filter()
 
         # Step 1A: Direct Input Sanitization & Validation
         sanitized_prompt = input_filter.sanitize(request.prompt)
@@ -450,9 +490,12 @@ async def process_ai_request(
             threshold = rules.get("semantic_threshold", 0.65)
             
             if templates:
-                detector = SemanticDetector()
-                detector.fit_templates(templates)
-                sem_result = detector.check_similarity(sanitized_prompt, threshold)
+                # Configured templates + learned feedback (confirmed attacks) — cached fit
+                learned = await asyncio.to_thread(get_learned_malicious_prompts, tenant_id)
+                templates = [*templates, *learned]
+                feedback_epoch = await asyncio.to_thread(get_feedback_epoch)
+                detector = get_fitted_detector(templates, feedback_epoch)
+                sem_result = await asyncio.to_thread(detector.check_similarity, sanitized_prompt, threshold)
                 
                 if sem_result["flagged"]:
                     action_taken = "blocked_semantic_jailbreak"
@@ -496,9 +539,9 @@ async def process_ai_request(
                 "reason": "no retrieved context provided"
             })
 
-        # Step 2: AI-powered Classification
+        # Step 2: AI-powered Classification (sync HF inference — keep off the event loop)
         classifier = get_classifier()
-        classification = classifier.classify(sanitized_prompt)
+        classification = await asyncio.to_thread(classifier.classify, sanitized_prompt)
         security_score = classification.get("score", 0.0)
         flagged = classification.get("flagged", False)
         add_trace("classification", "complete", {
@@ -510,10 +553,19 @@ async def process_ai_request(
         # Step 3: Policy Check & HITL Routing
         policy_manager = PolicyManager()
         if not policy_manager.check_policy(request.user_id, classification):
-            action_taken = "hitl_pending"
             add_trace("policy_check", "escalated", {
                 "reason": "policy rules required human review"
             })
+            if hitl_exempt:
+                # Flow was already human-cleared (resume/scanner); a repeat
+                # violation is blocked outright instead of re-entering HITL.
+                action_taken = "blocked_policy"
+                flagged = True
+                security_score = max(security_score, 0.8)
+                response_text = "Blocked: Request violates policy despite prior human clearance."
+                add_trace("policy_check", "blocked_exempt", {"reason": response_text})
+                return finalize_response()
+            action_taken = "hitl_pending"
             # Route to Human-in-the-Loop review
             hitl_manager = HITLManager()
 
@@ -579,7 +631,8 @@ async def process_ai_request(
 
         if request.execute_code and code_snippet:
             sandbox = SandboxManager()
-            sandbox_res = sandbox.execute_code(code_snippet, "python")
+            # subprocess wait blocks — run in a worker thread
+            sandbox_res = await asyncio.to_thread(sandbox.execute_code, code_snippet, "python")
             sandbox_result = {
                 "success": sandbox_res.get("success", False),
                 "output": sandbox_res.get("output", ""),
@@ -635,7 +688,9 @@ async def process_ai_request(
                     messages.append(LLMMessage(role="user", content=f"<retrieved_context untrusted=\"true\">\n{sanitized_context}\n</retrieved_context>"))
                 messages.append(LLMMessage(role="user", content=sanitized_prompt))
 
-                llm_response = pr.complete(
+                # Blocking network I/O — keep off the event loop
+                llm_response = await asyncio.to_thread(
+                    pr.complete,
                     messages=messages,
                     primary_provider_type=gw_config.primary_provider,
                     primary_url=gw_config.primary_url,
@@ -648,6 +703,12 @@ async def process_ai_request(
                     fallback_model=gw_config.fallback_model if gw_config else "",
                 )
                 response_text = llm_response.content
+
+                usage_totals["prompt_tokens"] = llm_response.usage.prompt_tokens
+                usage_totals["completion_tokens"] = llm_response.usage.completion_tokens
+                usage_totals["total_tokens"] = llm_response.usage.total_tokens
+                metrics.inc("tenant_tokens_total", value=float(llm_response.usage.total_tokens),
+                            labels={"tenant": tenant_id or "default"})
 
                 if "fallback" in llm_response.provider:
                     action_taken = "failover_routing"

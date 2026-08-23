@@ -10,7 +10,6 @@ import uuid
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 import json
-from elasticsearch import Elasticsearch
 from ..config.settings import settings
 from ..monitoring.database import SessionLocal, SecurityLog
 
@@ -62,126 +61,74 @@ def redact_for_log(value: Any, max_string: int = 500) -> Any:
         return result
     return value
 
-class SecurityLogger:
-    def __init__(self):
-        self.es_client = None
-        if settings.ELASTICSEARCH_HOST:
-            try:
-                self.es_client = Elasticsearch(
-                    hosts=[{"host": settings.ELASTICSEARCH_HOST, "port": settings.ELASTICSEARCH_PORT}]
-                )
-            except Exception as e:
-                logger.warning(f"Could not connect to Elasticsearch: {e}")
+def log_transaction(
+    user_id: str,
+    prompt: str,
+    response: Optional[str],
+    risk_score: float,
+    flagged: bool,
+    duration: float,
+    anomalies: List[Dict],
+    action_taken: str,
+    client_ip: Optional[str] = "127.0.0.1",
+    system_prompt: Optional[str] = None,
+    retrieved_context: Optional[str] = None,
+    trace: Optional[List[Dict]] = None,
+    tenant_id: Optional[str] = None,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    total_tokens: int = 0,
+):
+    """
+    Log a complete security transaction to the SQLite database
+    """
+    # Console output
+    log_entry = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "request_id": get_request_id(),
+        "user_id": user_id,
+        "tenant_id": tenant_id,
+        "prompt_len": len(prompt),
+        "response_len": len(response) if response else 0,
+        "risk_score": risk_score,
+        "flagged": flagged,
+        "duration": duration,
+        "anomalies": redact_for_log(anomalies),
+        "trace_steps": len(trace) if trace else 0,
+        "action_taken": action_taken
+    }
+    logger.info(f"Gateway Transaction: {json.dumps(log_entry)}")
 
-    def log_request(self, data: Dict[str, Any], log_type: str = "request"):
-        """Log a generic request to console and elasticsearch (if configured)"""
-        log_entry = {
-            "timestamp": datetime.utcnow().isoformat(),
-            "type": log_type,
-            "data": redact_for_log(data),
-            "source": "ai_security_gateway"
-        }
-        logger.info(f"Security Log - {log_type}: {json.dumps(log_entry)}")
-        if self.es_client:
-            try:
-                self.es_client.index(index="ai-security-logs", document=log_entry)
-            except Exception as e:
-                logger.error(f"Failed to log to Elasticsearch: {e}")
-
-    def log_transaction(
-        self,
-        user_id: str,
-        prompt: str,
-        response: Optional[str],
-        risk_score: float,
-        flagged: bool,
-        duration: float,
-        anomalies: List[Dict],
-        action_taken: str,
-        client_ip: Optional[str] = "127.0.0.1",
-        system_prompt: Optional[str] = None,
-        retrieved_context: Optional[str] = None,
-        trace: Optional[List[Dict]] = None,
-        tenant_id: Optional[str] = None
-    ):
-        """
-        Log a complete security transaction to the SQLite database
-        """
-        # Console output
-        log_entry = {
-            "timestamp": datetime.utcnow().isoformat(),
-            "request_id": get_request_id(),
-            "user_id": user_id,
-            "tenant_id": tenant_id,
-            "prompt_len": len(prompt),
-            "response_len": len(response) if response else 0,
-            "risk_score": risk_score,
-            "flagged": flagged,
-            "duration": duration,
-            "anomalies": redact_for_log(anomalies),
-            "trace_steps": len(trace) if trace else 0,
-            "action_taken": action_taken
-        }
-        logger.info(f"Gateway Transaction: {json.dumps(log_entry)}")
-
-        # SQLite write
-        session = SessionLocal()
-        try:
-            db_log = SecurityLog(
-                user_id=user_id,
-                prompt=prompt,
-                system_prompt=system_prompt,
-                retrieved_context=retrieved_context,
-                response=response,
-                risk_score=risk_score,
-                flagged=flagged,
-                duration=duration,
-                anomalies=json.dumps(anomalies),
-                trace_json=json.dumps(trace or []),
-                action_taken=action_taken,
-                client_ip=client_ip,
-                request_id=get_request_id() or None,
-                tenant_id=tenant_id,
-                timestamp=datetime.utcnow()
-            )
-            session.add(db_log)
-            session.commit()
-        except Exception as e:
-            session.rollback()
-            logger.error(f"Failed to write transaction to SQLite: {e}")
-        finally:
-            session.close()
-
-    def log_anomaly(self, anomaly_data: Dict[str, Any]):
-        """Log detected anomalies (console + optional ES)"""
-        anomaly_entry = {
-            "timestamp": datetime.utcnow().isoformat(),
-            "type": "anomaly",
-            "anomaly": redact_for_log(anomaly_data),
-            "severity": anomaly_data.get("severity", "medium")
-        }
-        logger.warning(f"Anomaly Detected: {json.dumps(anomaly_entry)}")
-
-        if self.es_client:
-            try:
-                self.es_client.index(index="ai-security-anomalies", document=anomaly_entry)
-            except Exception as e:
-                logger.error(f"Failed to log anomaly to Elasticsearch: {e}")
-
-    def log_security_event(self, event_data: Dict[str, Any]):
-        """Log security-related events (console + optional ES)"""
-        event_entry = {
-            "timestamp": datetime.utcnow().isoformat(),
-            "type": "security_event",
-            "event": redact_for_log(event_data)
-        }
-        logger.error(f"Security Event: {json.dumps(event_entry)}")
-
-        if self.es_client:
-            try:
-                self.es_client.index(index="ai-security-events", document=event_entry)
-            except Exception as e:
-                logger.error(f"Failed to log security event to Elasticsearch: {e}")
+    # SQLite write
+    session = SessionLocal()
+    try:
+        db_log = SecurityLog(
+            user_id=user_id,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            retrieved_context=retrieved_context,
+            response=response,
+            risk_score=risk_score,
+            flagged=flagged,
+            duration=duration,
+            anomalies=json.dumps(anomalies),
+            trace_json=json.dumps(trace or []),
+            action_taken=action_taken,
+            client_ip=client_ip,
+            request_id=get_request_id() or None,
+            tenant_id=tenant_id,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            timestamp=datetime.utcnow()
+        )
+        session.add(db_log)
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Failed to write transaction to SQLite: {e}")
+    finally:
+        session.close()
 
 class AnomalyDetector:
     def __init__(self):
@@ -230,8 +177,7 @@ class AnomalyDetector:
             "detected": len(anomalies) > 0
         }
 
-# Global instances
-security_logger = SecurityLogger()
+# Global anomaly detector instance
 anomaly_detector = AnomalyDetector()
 
 class StructuredJsonFormatter(logging.Formatter):
@@ -276,34 +222,6 @@ def setup_logging():
         handlers=[file_handler, stream_handler],
     )
     logging.getLogger("watchfiles").setLevel(logging.WARNING)
-
-def log_request(data: Dict[str, Any], log_type: str = "request"):
-    """Convenience function to log requests"""
-    security_logger.log_request(data, log_type)
-
-def log_transaction(
-    user_id: str,
-    prompt: str,
-    response: Optional[str],
-    risk_score: float,
-    flagged: bool,
-    duration: float,
-    anomalies: List[Dict],
-    action_taken: str,
-    client_ip: Optional[str] = "127.0.0.1",
-    system_prompt: Optional[str] = None,
-    retrieved_context: Optional[str] = None,
-    trace: Optional[List[Dict]] = None,
-    tenant_id: Optional[str] = None
-):
-    """Convenience function to log a complete transaction"""
-    security_logger.log_transaction(
-        user_id, prompt, response, risk_score, flagged, duration, anomalies, action_taken, client_ip, system_prompt, retrieved_context, trace, tenant_id
-    )
-
-def log_anomaly(anomaly_data: Dict[str, Any]):
-    """Convenience function to log anomalies"""
-    security_logger.log_anomaly(anomaly_data)
 
 def detect_anomaly(request_data: Dict[str, Any]) -> Dict[str, Any]:
     """Convenience function to detect anomalies"""

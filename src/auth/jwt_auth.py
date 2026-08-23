@@ -5,7 +5,6 @@ Supports HS256 (symmetric) and RS256 (asymmetric) algorithms.
 Tokens carry subject, tenant_id, roles, and standard JWT claims.
 """
 
-import time
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -104,30 +103,3 @@ def decode_access_token(token: str) -> Dict[str, Any]:
         raise TokenError("Token has expired") from exc
     except pyjwt.InvalidTokenError as exc:
         raise TokenError(f"Invalid token: {exc}") from exc
-
-
-def create_refresh_token(subject: str, tenant_id: str) -> str:
-    """Issue a longer-lived refresh token with minimal claims."""
-    algorithm = _resolve_algorithm()
-    key = _resolve_signing_key()
-
-    now = datetime.now(timezone.utc)
-    exp = now + timedelta(days=7)
-
-    payload = {
-        "sub": subject,
-        "tenant_id": tenant_id,
-        "type": "refresh",
-        "iat": now,
-        "exp": exp,
-        "iss": getattr(settings, "JWT_ISSUER", "ai-security-gateway"),
-    }
-    return pyjwt.encode(payload, key, algorithm=algorithm)
-
-
-def decode_refresh_token(token: str) -> Dict[str, Any]:
-    """Verify a refresh token.  Ensures the ``type`` claim is ``refresh``."""
-    claims = decode_access_token(token)
-    if claims.get("type") != "refresh":
-        raise TokenError("Token is not a refresh token")
-    return claims

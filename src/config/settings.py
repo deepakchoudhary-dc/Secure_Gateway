@@ -12,22 +12,16 @@ try:
 except Exception:
     pass
 try:
-    # Try importing from standard pydantic (V1)
-    from pydantic import BaseSettings
-except (ImportError, Exception):
-    try:
-        # Try importing from new pydantic-settings package (V2)
-        from pydantic_settings import BaseSettings
-    except (ImportError, Exception):
-        # Fall back to compatibility v1 namespace in Pydantic V2
-        from pydantic.v1 import BaseSettings
+    from pydantic.v1 import BaseSettings  # pydantic v2 namespace
+except ImportError:
+    from pydantic import BaseSettings  # pydantic v1
 
 _DEFAULT_DEV_SECRET = ""
 _PLACEHOLDER_SECRETS = {"", "your-secret-key-here", "dev-only-change-me"}
 _PRODUCTION_ENVIRONMENTS = {"prod", "production", "staging"}
 _DEFAULT_ALLOWED_ORIGINS = ["http://localhost:3000", "http://localhost:8080", "http://localhost:8000"]
 _DEFAULT_ALLOWED_METHODS = ["GET", "POST"]
-_DEFAULT_ALLOWED_HEADERS = ["Authorization", "Content-Type", "X-API-Key", "X-Admin-Token", "Idempotency-Key"]
+_DEFAULT_ALLOWED_HEADERS = ["Authorization", "Content-Type", "X-API-Key", "X-Admin-Token", "X-Client-ID", "Idempotency-Key"]
 _VALID_CORS_METHODS = {"DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"}
 
 
@@ -49,11 +43,7 @@ def _parse_csv_or_list(value: Any) -> List[str]:
 
 
 def _unique(values: List[str]) -> List[str]:
-    normalized = []
-    for value in values:
-        if value not in normalized:
-            normalized.append(value)
-    return normalized
+    return list(dict.fromkeys(values))
 
 
 def _normalize_origin(origin: str) -> str:
@@ -111,13 +101,13 @@ class Settings(BaseSettings):
     SANDBOX_MAX_OUTPUT_CHARS: int = 20000
     SANDBOX_MAX_CODE_CHARS: int = 20000
     SANDBOX_RUNNER_COMMAND: Optional[str] = None
+    # Example (container runner, see deploy/sandbox-runner.Dockerfile):
+    #   SANDBOX_RUNNER_COMMAND=docker run --rm --network none --memory 256m --cpus 0.5 --read-only -v <host-script-dir>:/sandbox:ro ai-sandbox-runner /sandbox/sandbox_run.py
     SANDBOX_ALLOW_HOST_RUNNER_IN_PRODUCTION: bool = False
     SANDBOX_ALLOW_HOST_RUNNER_IN_TESTS: bool = False
 
     # Monitoring
     LOG_LEVEL: str = "INFO"
-    ELASTICSEARCH_HOST: str = ""
-    ELASTICSEARCH_PORT: int = 9200
     REDTEAM_ENDPOINTS_ENABLED: bool = False
 
     # Human-in-the-Loop
@@ -125,7 +115,6 @@ class Settings(BaseSettings):
     HITL_BLOCKING_WAIT: bool = False
     HITL_APPROVAL_TIMEOUT_SECONDS: int = 300
     HITL_EMAIL: str = "admin@example.com"
-    HITL_EXPIRY_HOURS: int = 24
 
     # Authentication Mode
     AUTH_MODE: str = "jwt"  # api_key | jwt
@@ -172,6 +161,12 @@ class Settings(BaseSettings):
     IDEMPOTENCY_TTL_SECONDS: int = 86400  # 24 hours
     IDEMPOTENCY_MAX_RESPONSE_BYTES: int = 1048576  # 1MB
 
+    # Request limits
+    MAX_BODY_BYTES: int = 1048576  # 1MB ASGI-level body cap
+
+    # Token accounting (per-tenant daily LLM token budget; 0 = unlimited)
+    TENANT_DAILY_TOKEN_LIMIT: int = 0
+
     class Config:
         env_file = ".env"
         extra = "ignore"
@@ -181,6 +176,7 @@ class Settings(BaseSettings):
         self.ENVIRONMENT = os.getenv("APP_ENV", self.ENVIRONMENT).strip().lower()
         if self.ENVIRONMENT == "development":
             self.REDTEAM_ENDPOINTS_ENABLED = True
+        self.ALLOWED_ORIGINS = self._validated_origins(self.ALLOWED_ORIGINS)
         self.ALLOWED_METHODS = self._validated_methods(self.ALLOWED_METHODS)
         self.ALLOWED_HEADERS = self._validated_headers(self.ALLOWED_HEADERS)
         self.SECRET_KEY = self._validated_secret(self.SECRET_KEY)
@@ -246,6 +242,8 @@ class Settings(BaseSettings):
 
         if self.AUTH_MODE not in {"api_key", "jwt"}:
             raise ValueError("AUTH_MODE must be api_key or jwt")
+        if self.DATABASE_URL.startswith("sqlite"):
+            raise ValueError("Production requires a client-server DATABASE_URL (e.g. postgresql://...)")
         if not self.REQUIRE_AUTH or not self.REQUIRE_ADMIN_AUTH:
             raise ValueError("Production authentication and administrative authorization must be enabled")
         if self.AUTH_MODE == "api_key":
@@ -267,6 +265,8 @@ class Settings(BaseSettings):
             raise ValueError("Production requires SECRETS_BACKEND=vault")
         if not (self.VAULT_ADDR or "").strip().startswith("https://"):
             raise ValueError("Production requires an HTTPS VAULT_ADDR")
+        if self.HITL_EMAIL.strip().lower() in {"", "admin@example.com"}:
+            raise ValueError("Production requires a real HITL_EMAIL recipient")
 
     def _validate_production_sandbox(self):
         if not self._is_production:

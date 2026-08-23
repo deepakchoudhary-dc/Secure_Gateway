@@ -110,67 +110,45 @@ class GeminiProvider(LLMProvider):
         max_tokens: Optional[int],
         timeout: float,
     ) -> LLMResponse:
-        # Candidate model names to try if 404 is encountered
-        candidate_models = [model]
-        if not model.endswith("-latest"):
-            candidate_models.append(f"{model}-latest")
-        if "gemini-2.0-flash" not in candidate_models:
-            candidate_models.append("gemini-2.0-flash")
-        if "gemini-1.5-flash" not in candidate_models:
-            candidate_models.append("gemini-1.5-flash")
-        if "gemini-1.5-pro" not in candidate_models:
-            candidate_models.append("gemini-1.5-pro")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": self._api_key,
+        }
+        if not self._api_key.startswith("AIza"):
+            headers["Authorization"] = f"Bearer {self._api_key}"
 
-        last_error = None
-        for current_model in candidate_models:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{current_model}:generateContent"
-            headers = {
-                "Content-Type": "application/json",
-                "x-goog-api-key": self._api_key,
+        system_instruction = None
+        contents = []
+
+        for m in messages:
+            if m.role == "system":
+                system_instruction = {"parts": [{"text": m.content}]}
+            else:
+                role = "user" if m.role == "user" else "model"
+                contents.append({"role": role, "parts": [{"text": m.content}]})
+
+        payload: Dict[str, Any] = {
+            "contents": contents,
+            "generationConfig": {
+                "temperature": temperature,
             }
-            if not self._api_key.startswith("AIza"):
-                headers["Authorization"] = f"Bearer {self._api_key}"
+        }
+        if system_instruction:
+            payload["systemInstruction"] = system_instruction
+        if max_tokens is not None:
+            payload["generationConfig"]["maxOutputTokens"] = max_tokens
 
-            system_instruction = None
-            contents = []
+        start = time.monotonic()
+        try:
+            resp = self._session.post(url, headers=headers, json=payload, timeout=timeout, allow_redirects=True)
+        except requests.exceptions.Timeout as exc:
+            raise ProviderError(f"Gemini request timed out after {timeout}s", retryable=True) from exc
+        except requests.exceptions.ConnectionError as exc:
+            raise ProviderError(f"Gemini connection failed: {exc}", retryable=True) from exc
+        latency = (time.monotonic() - start) * 1000
 
-            for m in messages:
-                if m.role == "system":
-                    system_instruction = {"parts": [{"text": m.content}]}
-                else:
-                    role = "user" if m.role == "user" else "model"
-                    contents.append({"role": role, "parts": [{"text": m.content}]})
-
-            payload: Dict[str, Any] = {
-                "contents": contents,
-                "generationConfig": {
-                    "temperature": temperature,
-                }
-            }
-            if system_instruction:
-                payload["systemInstruction"] = system_instruction
-            if max_tokens is not None:
-                payload["generationConfig"]["maxOutputTokens"] = max_tokens
-
-            start = time.monotonic()
-            try:
-                resp = self._session.post(url, headers=headers, json=payload, timeout=timeout, allow_redirects=True)
-            except requests.exceptions.Timeout as exc:
-                raise ProviderError(f"Gemini request timed out after {timeout}s", retryable=True) from exc
-            except requests.exceptions.ConnectionError as exc:
-                raise ProviderError(f"Gemini connection failed: {exc}", retryable=True) from exc
-            latency = (time.monotonic() - start) * 1000
-
-            if resp.status_code == 200:
-                raw = resp.json()
-                self.validate_response(raw)
-                return self._parse_response(raw, current_model, latency)
-
-            if resp.status_code == 404:
-                logger.warning(f"Gemini model {current_model} returned 404, trying next candidate model...")
-                last_error = ProviderError(f"Gemini API error 404: {resp.text[:300]}", status_code=404, retryable=False)
-                continue
-
+        if resp.status_code != 200:
             retryable = resp.status_code not in _NON_RETRYABLE_STATUS
             raise ProviderError(
                 f"Gemini API error {resp.status_code}: {resp.text[:500]}",
@@ -178,7 +156,9 @@ class GeminiProvider(LLMProvider):
                 retryable=retryable,
             )
 
-        raise last_error or ProviderError("All candidate Gemini models returned 404", status_code=404, retryable=False)
+        raw = resp.json()
+        self.validate_response(raw)
+        return self._parse_response(raw, model, latency)
 
     def validate_response(self, raw: Dict[str, Any]) -> None:
         if "candidates" not in raw or not raw["candidates"]:

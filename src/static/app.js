@@ -2,14 +2,27 @@
  * AI Security Gateway - Frontend Application Controller
  */
 
+// Credentials are entered once per browser session and never stored in code.
+// ponytail: prompt()-based login is minimal; upgrade path is a proper login
+// view issuing a short-lived JWT session.
+function getCredential(headerName, label) {
+    const key = 'gw_' + headerName;
+    let value = sessionStorage.getItem(key);
+    if (!value) {
+        value = window.prompt('Gateway ' + label + ':') || '';
+        sessionStorage.setItem(key, value);
+    }
+    return value;
+}
+
 // Helper for API fetch with admin auth header
 async function apiFetch(url, options = {}) {
     options.headers = options.headers || {};
     if (!options.headers['X-Admin-Token'] && !options.headers['x-admin-token']) {
-        options.headers['X-Admin-Token'] = 'admin-secret-key-12345678901234567890';
+        options.headers['X-Admin-Token'] = getCredential('admin-token', 'admin token');
     }
     if (!options.headers['X-API-Key'] && !options.headers['x-api-key']) {
-        options.headers['X-API-Key'] = 'user-secret-key-12345678901234567890';
+        options.headers['X-API-Key'] = getCredential('api-key', 'API key');
     }
     return fetch(url, options);
 }

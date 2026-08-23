@@ -13,7 +13,7 @@ uses to send requests to external LLM providers.  It encapsulates:
 import ipaddress
 import logging
 import socket
-from typing import Dict, List, Optional
+from typing import Dict, List
 from urllib.parse import urlparse
 
 from ..config.settings import settings
@@ -40,6 +40,7 @@ class ProviderRouter:
 
     def __init__(self):
         self._breakers: Dict[str, CircuitBreaker] = {}
+        self._provider_cache: Dict[tuple, LLMProvider] = {}
         self._max_retries = int(getattr(settings, "PROVIDER_RETRY_MAX", 3))
         self._base_delay = float(getattr(settings, "PROVIDER_RETRY_BASE_DELAY", 0.5))
         self._request_timeout = float(getattr(settings, "PROVIDER_REQUEST_TIMEOUT", 30.0))
@@ -78,6 +79,18 @@ class ProviderRouter:
             return GeminiProvider(base_url=url, api_key=key, default_model=model or "gemini-1.5-flash")
         raise ProviderError(f"Unknown provider type: {provider_type}", retryable=False)
 
+    def get_provider(self, provider_type: str, url: str, key: str, model: str) -> LLMProvider:
+        """Cached build so HTTP sessions (TCP+TLS) are reused across requests."""
+        cache_key = (provider_type, url, key, model)
+        provider = self._provider_cache.get(cache_key)
+        if provider is None:
+            provider = self.build_provider(provider_type, url, key, model)
+            # ponytail: clear-all on overflow — real deployments have a handful of configs
+            if len(self._provider_cache) >= 32:
+                self._provider_cache.clear()
+            self._provider_cache[cache_key] = provider
+        return provider
+
     def complete(
         self,
         messages: List[LLMMessage],
@@ -98,7 +111,7 @@ class ProviderRouter:
             if primary_url:
                 self._check_egress(primary_url)
 
-        primary = self.build_provider(primary_provider_type, primary_url, primary_key, primary_model)
+        primary = self.get_provider(primary_provider_type, primary_url, primary_key, primary_model)
         breaker = self._get_breaker(f"primary:{primary_provider_type}")
 
         try:
@@ -129,7 +142,7 @@ class ProviderRouter:
             if fallback_url:
                 self._check_egress(fallback_url)
 
-        fallback = self.build_provider(fallback_provider_type, fallback_url, fallback_key, fallback_model)
+        fallback = self.get_provider(fallback_provider_type, fallback_url, fallback_key, fallback_model)
         fb_breaker = self._get_breaker(f"fallback:{fallback_provider_type}")
 
         try:
@@ -156,6 +169,23 @@ class ProviderRouter:
         return {name: cb.to_dict() for name, cb in self._breakers.items()}
 
 
+def assert_https_public_host(url: str) -> None:
+    """Shared egress check: HTTPS scheme, resolvable hostname, all IPs globally routable.
+
+    Raises ``ValueError``; used at gateway-config write time and (wrapped in
+    ``EgressDenied``) immediately before outbound dispatch.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError("Outbound model URL must be HTTPS with a hostname")
+    try:
+        addresses = socket.getaddrinfo(parsed.hostname, None)
+    except socket.gaierror as exc:
+        raise ValueError(f"Cannot resolve outbound model hostname: {parsed.hostname}") from exc
+    if any(not ipaddress.ip_address(address[4][0]).is_global for address in addresses):
+        raise ValueError("Outbound model URL resolves to a non-public network address")
+
+
 def validate_outbound_url(url: str, allowlist: List[str]) -> None:
     """Fail-closed validation performed immediately before outbound dispatch."""
     parsed = urlparse(url)
@@ -165,8 +195,6 @@ def validate_outbound_url(url: str, allowlist: List[str]) -> None:
     if not allowlist or not any(host == allowed or host.endswith("." + allowed) for allowed in allowlist):
         raise EgressDenied(url)
     try:
-        addresses = socket.getaddrinfo(host, parsed.port or 443, type=socket.SOCK_STREAM)
-    except socket.gaierror as exc:
-        raise EgressDenied(url) from exc
-    if not addresses or any(not ipaddress.ip_address(address[4][0]).is_global for address in addresses):
-        raise EgressDenied(url)
+        assert_https_public_host(url)
+    except ValueError as exc:
+        raise EgressDenied(str(exc)) from exc

@@ -11,9 +11,7 @@ from src.monitoring.database import init_db
 init_db()
 
 import pytest
-from datetime import datetime, timedelta
 from src.hitl.hitl_manager import HITLManager
-from src.monitoring.database import SessionLocal, HITLRequest
 
 
 @pytest.fixture
@@ -80,38 +78,6 @@ class TestHITLAssignment:
             details = hitl_manager.get_request_details(result["request_id"])
             assert details is not None
             assert details.get("assigned_to") == "reviewer@example.com"
-
-
-class TestHITLExpiration:
-    def test_expire_stale_requests(self, hitl_manager):
-        """Stale requests older than expiry_hours should be expired."""
-        session = SessionLocal()
-        try:
-            session.query(HITLRequest).filter(HITLRequest.request_id == "hitl_stale_test_001").delete()
-            session.commit()
-            old_req = HITLRequest(
-                request_id="hitl_stale_test_001",
-                prompt="Old request",
-                user_id="stale_user",
-                status="pending",
-                created_at=datetime.utcnow() - timedelta(hours=hitl_manager.expiry_hours + 1),
-            )
-            session.add(old_req)
-            session.commit()
-        finally:
-            session.close()
-
-        count = hitl_manager.expire_stale_requests()
-        assert count >= 1
-
-        # Verify it was expired
-        session = SessionLocal()
-        try:
-            req = session.query(HITLRequest).filter(HITLRequest.request_id == "hitl_stale_test_001").first()
-            assert req is not None
-            assert req.status == "timeout"
-        finally:
-            session.close()
 
 
 class TestHITLHistory:

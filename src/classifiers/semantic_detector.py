@@ -1,6 +1,6 @@
 import logging
 import numpy as np
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -67,3 +67,18 @@ class SemanticDetector:
         except Exception as e:
             logger.error(f"Error calculating semantic similarity: {e}")
             return {"flagged": False, "score": 0.0, "matched_pattern": None}
+
+
+# Fitted-detector cache: refits only when the template set (configured +
+# learned feedback) actually changes. Avoids a per-request TF-IDF fit.
+_cached_detector = {"key": None, "det": None}
+
+
+def get_fitted_detector(templates: List[str], feedback_epoch: Tuple[int, int] = (0, 0)) -> SemanticDetector:
+    key = (tuple(templates), feedback_epoch)
+    if _cached_detector["det"] is None or _cached_detector["key"] != key:
+        detector = SemanticDetector()
+        detector.fit_templates(list(templates))
+        _cached_detector["key"] = key
+        _cached_detector["det"] = detector
+    return _cached_detector["det"]

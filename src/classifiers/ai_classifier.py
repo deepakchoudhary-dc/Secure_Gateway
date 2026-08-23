@@ -4,7 +4,7 @@ AI Classifier Module - Uses AI model pipelines for security check, falling back 
 
 import logging
 import re
-from typing import Dict, List
+from typing import Dict
 from ..config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -170,37 +170,3 @@ class AIClassifier:
                 detection["score"] = max(detection["score"], weight)
 
         return detection
-
-    def semantic_analysis(self, text: str) -> Dict:
-        """
-        Perform basic semantic analysis returning sentiment, complexity, and risk level
-        """
-        classification = self.classify(text)
-        
-        # Simple sentiment heuristics
-        sentiment = "neutral"
-        if classification["flagged"]:
-            sentiment = "negative"
-        elif any(w in text.lower() for w in ["great", "awesome", "thanks", "perfect", "good"]):
-            sentiment = "positive"
-
-        # Complexity
-        words = text.split()
-        complexity = "low"
-        if len(words) > 150:
-            complexity = "high"
-        elif len(words) > 50:
-            complexity = "medium"
-
-        risk_level = "low"
-        if classification["score"] > 0.7:
-            risk_level = "high"
-        elif classification["score"] > 0.3:
-            risk_level = "medium"
-
-        return {
-            "sentiment": sentiment,
-            "complexity": complexity,
-            "topics": classification["categories"],
-            "risk_level": risk_level
-        }
