@@ -25,7 +25,17 @@ class HITLManager:
     def __init__(self):
         self.approval_timeout = settings.HITL_APPROVAL_TIMEOUT_SECONDS
 
-    async def create_request(self, request_data: Any) -> Dict[str, Any]:
+    def _compute_priority(self, risk_score: float) -> int:
+        # ponytail: 4-tier priority from risk_score; per-request override via request_data.priority if provided
+        if risk_score >= 0.85:
+            return 3  # critical
+        if risk_score >= 0.6:
+            return 2  # high
+        if risk_score >= 0.3:
+            return 1  # medium
+        return 0  # low
+
+    async def create_request(self, request_data: Any, risk_score: float = 0.0) -> Dict[str, Any]:
         """
         Create a human approval request and return immediately.
         """
@@ -41,6 +51,28 @@ class HITLManager:
 
         request_id = self._generate_request_id()
         fields = self._extract_request_fields(request_data)
+        # allow risk_score from request_data or explicit param
+        try:
+            rs = float(fields.get("risk_score", risk_score) or risk_score)
+        except Exception:
+            rs = float(risk_score or 0.0)
+        priority = fields.get("priority")
+        if priority is None:
+            priority = self._compute_priority(rs)
+        else:
+            try:
+                priority = int(priority)
+            except Exception:
+                priority = self._compute_priority(rs)
+        priority = max(0, min(3, int(priority)))
+        sla_deadline = None
+        try:
+            sla_hours = int(getattr(settings, "HITL_SLA_HOURS", 4) or 4)
+            if sla_hours > 0:
+                from datetime import timedelta
+                sla_deadline = datetime.utcnow() + timedelta(hours=sla_hours)
+        except Exception:
+            sla_deadline = None
 
         session = SessionLocal()
         try:
@@ -56,6 +88,9 @@ class HITLManager:
                 notification_sent=False,
                 callback_url=fields.get("callback_url"),
                 resume_on_approval=fields.get("resume_on_approval", False),
+                priority=priority,
+                risk_score=float(rs),
+                sla_deadline=sla_deadline,
                 created_at=datetime.utcnow()
             )
             session.add(db_request)
@@ -90,7 +125,7 @@ class HITLManager:
             "created": True
             }
 
-    async def request_approval(self, request_data: Any) -> Dict[str, Any]:
+    async def request_approval(self, request_data: Any, risk_score: float = 0.0) -> Dict[str, Any]:
         """
         Request human approval for high-risk requests.
 
@@ -99,9 +134,9 @@ class HITLManager:
         the legacy wait-for-decision behavior.
         """
         if not settings.HITL_BLOCKING_WAIT:
-            return await self.create_request(request_data)
+            return await self.create_request(request_data, risk_score=risk_score)
 
-        return await self._request_approval_blocking_result(request_data)
+        return await self._request_approval_blocking_result(request_data, risk_score=risk_score)
 
     async def request_approval_blocking(self, request_data: Any) -> bool:
         """
@@ -110,9 +145,9 @@ class HITLManager:
         """
         return bool(await self._request_approval_blocking_result(request_data))
 
-    async def _request_approval_blocking_result(self, request_data: Any) -> Dict[str, Any]:
+    async def _request_approval_blocking_result(self, request_data: Any, risk_score: float = 0.0) -> Dict[str, Any]:
         """Create a HITL request and block until a decision or timeout."""
-        created = await self.create_request(request_data)
+        created = await self.create_request(request_data, risk_score=risk_score)
         if created.get("status") != "pending":
             return created
 
@@ -165,6 +200,8 @@ class HITLManager:
             "user_id": field("user_id", "unknown"),
             "callback_url": opt("callback_url"),
             "resume_on_approval": bool(opt("resume_on_approval")),
+            "risk_score": opt("risk_score") if opt("risk_score") is not None else opt("security_score"),
+            "priority": opt("priority"),
         }
 
     def _mark_timeout(self, request_id: str):
@@ -310,13 +347,22 @@ class HITLManager:
         finally:
             session.close()
 
-    def get_pending_requests(self) -> Dict[str, Dict]:
-        """Get all pending approval requests from DB"""
+    def get_pending_requests(self, sort_by_priority: bool = True) -> Dict[str, Dict]:
+        """Get all pending approval requests from DB, priority queue sorted"""
         session = SessionLocal()
         try:
-            db_reqs = session.query(HITLRequest).filter(HITLRequest.status == "pending").all()
-            return {
-                r.request_id: {
+            query = session.query(HITLRequest).filter(HITLRequest.status == "pending")
+            if sort_by_priority and getattr(settings, "HITL_PRIORITY_ENABLED", True):
+                query = query.order_by(HITLRequest.priority.desc(), HITLRequest.created_at.asc())
+            else:
+                query = query.order_by(HITLRequest.created_at.asc())
+            db_reqs = query.all()
+            now = datetime.utcnow()
+            result = {}
+            for r in db_reqs:
+                is_overdue = bool(getattr(r, "sla_deadline", None) and r.sla_deadline and r.sla_deadline < now)
+                is_escalated = bool(getattr(r, "escalated_at", None))
+                result[r.request_id] = {
                     "id": r.request_id,
                     "prompt": r.prompt,
                     "context": r.context,
@@ -326,12 +372,104 @@ class HITLManager:
                     "status": r.status,
                     "assigned_to": getattr(r, "assigned_to", None),
                     "notification_sent": getattr(r, "notification_sent", False),
+                    "priority": getattr(r, "priority", 0) or 0,
+                    "risk_score": getattr(r, "risk_score", 0.0) or 0.0,
+                    "sla_deadline": r.sla_deadline.isoformat() if getattr(r, "sla_deadline", None) else None,
+                    "is_overdue": is_overdue,
+                    "is_escalated": is_escalated,
                 }
-                for r in db_reqs
-            }
+            return result
         except Exception as e:
             logger.error(f"Error fetching pending requests: {e}")
             return {}
+        finally:
+            session.close()
+
+    def batch_approve(self, request_ids: List[str], approved: bool, admin_name: str = "Admin") -> Dict[str, Any]:
+        """Batch approve/deny multiple requests. Returns summary."""
+        results = {"succeeded": [], "failed": [], "total": len(request_ids)}
+        # run sequentially to keep DB transactions simple
+        import asyncio
+        loop = None
+        try:
+            loop = asyncio.get_event_loop()
+        except Exception:
+            loop = None
+        for rid in request_ids:
+            try:
+                # reuse approve_request logic synchronously via direct DB update for batch speed
+                session = SessionLocal()
+                try:
+                    db_req = session.query(HITLRequest).filter(HITLRequest.request_id == rid).first()
+                    if not (db_req and db_req.status == "pending"):
+                        results["failed"].append({"id": rid, "reason": "not found or not pending"})
+                        continue
+                    db_req.status = "approved" if approved else "denied"
+                    db_req.decision_by = admin_name
+                    db_req.decision_at = datetime.utcnow()
+                    # record feedback
+                    try:
+                        record_feedback(
+                            source="hitl_denied" if not approved else "hitl_approved",
+                            label="malicious" if not approved else "benign",
+                            prompt=db_req.prompt,
+                            tenant_id=db_req.tenant_id,
+                        )
+                    except Exception:
+                        pass
+                    session.commit()
+                    results["succeeded"].append(rid)
+                except Exception as e:
+                    session.rollback()
+                    results["failed"].append({"id": rid, "reason": str(e)})
+                finally:
+                    session.close()
+            except Exception as e:
+                results["failed"].append({"id": rid, "reason": str(e)})
+        return results
+
+    def escalate_overdue(self) -> List[str]:
+        """SLA escalation: mark overdue pending requests as escalated. Returns escalated ids."""
+        try:
+            sla_hours = int(getattr(settings, "HITL_SLA_HOURS", 4) or 4)
+            if sla_hours <= 0:
+                return []
+        except Exception:
+            return []
+        now = datetime.utcnow()
+        session = SessionLocal()
+        try:
+            overdue = session.query(HITLRequest).filter(
+                HITLRequest.status == "pending",
+                HITLRequest.sla_deadline.isnot(None),
+                HITLRequest.sla_deadline < now,
+                HITLRequest.escalated_at.is_(None)
+            ).all()
+            escalated_ids = []
+            for r in overdue:
+                r.escalated_at = now
+                # assign to escalation email if configured
+                esc_email = getattr(settings, "HITL_ESCALATION_EMAIL", "") or getattr(settings, "HITL_EMAIL", "")
+                if esc_email:
+                    try:
+                        enqueue_notification(
+                            session,
+                            recipient=esc_email,
+                            subject=f"[ESCALATED] HITL Review Overdue: {r.request_id}",
+                            body=f"Request {r.request_id} breached SLA ({sla_hours}h). Prompt: {r.prompt[:500]}",
+                            metadata={"request_id": r.request_id, "escalated": True},
+                        )
+                    except Exception:
+                        pass
+                escalated_ids.append(r.request_id)
+            if escalated_ids:
+                session.commit()
+                logger.warning(f"SLA escalated {len(escalated_ids)} overdue HITL requests")
+            return escalated_ids
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Error escalating overdue HITL requests: {e}")
+            return []
         finally:
             session.close()
 
@@ -341,6 +479,8 @@ class HITLManager:
         try:
             r = session.query(HITLRequest).filter(HITLRequest.request_id == request_id).first()
             if r:
+                now = datetime.utcnow()
+                is_overdue = bool(getattr(r, "sla_deadline", None) and r.sla_deadline and r.sla_deadline < now and r.status == "pending")
                 return {
                     "id": r.request_id,
                     "prompt": r.prompt,
@@ -354,6 +494,11 @@ class HITLManager:
                     "assigned_to": getattr(r, "assigned_to", None),
                     "escalated_at": r.escalated_at.isoformat() if getattr(r, "escalated_at", None) else None,
                     "notification_sent": getattr(r, "notification_sent", False),
+                    "priority": getattr(r, "priority", 0) or 0,
+                    "risk_score": getattr(r, "risk_score", 0.0) or 0.0,
+                    "sla_deadline": r.sla_deadline.isoformat() if getattr(r, "sla_deadline", None) else None,
+                    "is_overdue": is_overdue,
+                    "is_escalated": bool(getattr(r, "escalated_at", None)),
                 }
             return None
         except Exception as e:
@@ -383,6 +528,8 @@ class HITLManager:
                 "decision_at": r.decision_at.isoformat() if r.decision_at else None,
                 "created_at": r.created_at.isoformat() if r.created_at else None,
                 "assigned_to": getattr(r, "assigned_to", None),
+                "priority": getattr(r, "priority", 0) or 0,
+                "risk_score": getattr(r, "risk_score", 0.0) or 0.0,
             } for r in db_reqs]
         except Exception as e:
             logger.error("Error fetching HITL history: %s", e)

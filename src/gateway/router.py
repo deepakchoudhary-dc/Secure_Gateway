@@ -125,6 +125,11 @@ class HITLDecision(BaseModel):
 class HITLAssignment(BaseModel):
     assigned_to: str = Field(..., min_length=1, max_length=200)
 
+class HITLBatchDecision(BaseModel):
+    request_ids: List[str] = Field(..., min_length=1)
+    approved: bool
+    admin_name: Optional[str] = "Admin"
+
 class PolicyUpdate(BaseModel):
     policies: Dict[str, Any]
 
@@ -600,7 +605,7 @@ async def process_ai_request_impl(
             hitl_manager = HITLManager()
 
             if not settings.HITL_BLOCKING_WAIT:
-                hitl_state = await hitl_manager.create_request(request)
+                hitl_state = await hitl_manager.create_request(request, risk_score=security_score)
                 if not hitl_state.get("created") and not hitl_state.get("approved"):
                     action_taken = "hitl_queue_error"
                     flagged = True
@@ -621,7 +626,7 @@ async def process_ai_request_impl(
                     })
                     return finalize_response()
             else:
-                approved = await hitl_manager.request_approval(request)
+                approved = await hitl_manager.request_approval(request, risk_score=security_score)
                 if not approved:
                     action_taken = "hitl_denied"
                     response_text = "Blocked: Request denied by human security reviewer."
@@ -926,9 +931,43 @@ async def update_policies(update: PolicyUpdate):
 # Human-in-the-Loop endpoints
 @router.get("/hitl/pending", dependencies=[_get_admin_dependency()])
 async def get_hitl_pending():
-    """Fetch all pending manual approvals"""
+    """Fetch all pending manual approvals — priority queue sorted, SLA auto-escalated"""
     hitl_manager = HITLManager()
+    # ponytail: lazy SLA check on read — no cron needed; keeps DB writes on read path minimal
+    try:
+        hitl_manager.escalate_overdue()
+    except Exception:
+        pass
     return hitl_manager.get_pending_requests()
+
+@router.get("/hitl/events", dependencies=[_get_admin_dependency()])
+async def hitl_events():
+    """SSE stream for HITL queue live updates — replaces polling pollPendingHITL every 5s"""
+    from fastapi.responses import StreamingResponse
+
+    async def event_gen():
+        last_payload = None
+        # ponytail: poll DB every 2s, push only on change — minimal, no extra deps (websockets)
+        while True:
+            try:
+                mgr = HITLManager()
+                # keep SLA fresh while streaming
+                try:
+                    mgr.escalate_overdue()
+                except Exception:
+                    pass
+                pending = mgr.get_pending_requests()
+                payload = json.dumps({"pending": pending, "count": len(pending)})
+                if payload != last_payload:
+                    last_payload = payload
+                    yield f"data: {payload}\n\n"
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            await asyncio.sleep(2)
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 @router.post("/hitl/approve/{request_id}", dependencies=[_get_admin_dependency()])
 async def approve_hitl_request(request_id: str, decision: HITLDecision):
@@ -960,6 +999,20 @@ async def assign_hitl_request(request_id: str, assignment: HITLAssignment):
     if not success:
         raise HTTPException(status_code=404, detail="Request not found or not in pending state")
     return {"status": "success", "message": f"Request {request_id} assigned to {assignment.assigned_to}"}
+
+@router.post("/hitl/batch", dependencies=[_get_admin_dependency()])
+async def batch_hitl_request(decision: HITLBatchDecision):
+    """Batch approve/deny multiple pending requests"""
+    hitl_manager = HITLManager()
+    result = hitl_manager.batch_approve(decision.request_ids, decision.approved, decision.admin_name or "Admin")
+    return result
+
+@router.post("/hitl/escalate", dependencies=[_get_admin_dependency()])
+async def escalate_hitl():
+    """Trigger SLA escalation check for overdue pending requests"""
+    hitl_manager = HITLManager()
+    escalated = hitl_manager.escalate_overdue()
+    return {"escalated": escalated, "count": len(escalated)}
 
 @router.get("/hitl/history", dependencies=[_get_admin_dependency()])
 async def get_hitl_history(limit: int = 50, offset: int = 0):

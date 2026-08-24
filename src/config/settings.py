@@ -115,6 +115,9 @@ class Settings(BaseSettings):
     HITL_BLOCKING_WAIT: bool = False
     HITL_APPROVAL_TIMEOUT_SECONDS: int = 300
     HITL_EMAIL: str = "admin@example.com"
+    HITL_SLA_HOURS: int = 4  # SLA deadline for pending reviews
+    HITL_PRIORITY_ENABLED: bool = True
+    HITL_ESCALATION_EMAIL: str = ""  # secondary reviewer for SLA breaches
 
     # Authentication Mode
     AUTH_MODE: str = "jwt"  # api_key | jwt

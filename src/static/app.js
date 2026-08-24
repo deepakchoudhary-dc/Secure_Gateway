@@ -34,6 +34,8 @@ const STATE = {
     activePolicyName: 'input_validation',
     hitlRequests: {},
     activeHitlId: null,
+    selectedHitlIds: new Set(),
+    hitlEventSource: null,
     logs: [],
     logsPage: 0,
     logsLimit: 12,
@@ -81,6 +83,11 @@ const DOM = {
     hitlDetailsBody: document.getElementById('hitl-details-body'),
     hitlApproveBtn: document.getElementById('hitl-approve-btn'),
     hitlDenyBtn: document.getElementById('hitl-deny-btn'),
+    hitlSelectAll: document.getElementById('hitl-select-all'),
+    hitlBatchApprove: document.getElementById('hitl-batch-approve'),
+    hitlBatchDeny: document.getElementById('hitl-batch-deny'),
+    hitlEscalateBtn: document.getElementById('hitl-escalate-btn'),
+    hitlSseStatus: document.getElementById('hitl-sse-status'),
     
     // Logs elements
     logsTbody: document.getElementById('logs-tbody'),
@@ -166,8 +173,9 @@ document.addEventListener('DOMContentLoaded', () => {
     // Sync all statistics initially
     syncAllData();
     
-    // Periodically poll for pending HITL requests (every 5 seconds)
-    STATE.hitlPollInterval = setInterval(pollPendingHITL, 5000);
+    // Live updates via SSE with polling fallback
+    connectHitlSSE();
+    STATE.hitlPollInterval = setInterval(pollPendingHITL, 15000);
 });
 
 // Sync data
@@ -644,28 +652,105 @@ async function saveActivePolicy() {
 }
 
 // -----------------------------------------------------
-// 3. HUMAN-IN-THE-LOOP (HITL) WORKFLOW
+// 3. HUMAN-IN-THE-LOOP (HITL) WORKFLOW — priority queue, batch, SLA, SSE
 // -----------------------------------------------------
+function getPriorityMeta(p) {
+    const map = {
+        3: {label:'CRITICAL', color:'#ff1744', bg:'rgba(255,23,68,0.15)'},
+        2: {label:'HIGH', color:'#ff9100', bg:'rgba(255,145,0,0.15)'},
+        1: {label:'MEDIUM', color:'#ffd600', bg:'rgba(255,214,0,0.15)'},
+        0: {label:'LOW', color:'#00e676', bg:'rgba(0,230,118,0.12)'}
+    };
+    return map[p] || map[0];
+}
+
+function connectHitlSSE() {
+    try {
+        const es = new EventSource('/api/v1/hitl/events');
+        STATE.hitlEventSource = es;
+        es.onmessage = (e) => {
+            try {
+                const data = JSON.parse(e.data);
+                if (data.pending) {
+                    STATE.hitlRequests = data.pending;
+                    const count = Object.keys(STATE.hitlRequests).length;
+                    if (count > 0) { DOM.hitlBadge.innerText = count; DOM.hitlBadge.style.display = 'block'; }
+                    else { DOM.hitlBadge.style.display = 'none'; }
+                    if (STATE.activeTab === 'hitl') loadHITLList();
+                    if (DOM.hitlSseStatus) { DOM.hitlSseStatus.textContent = '● live'; DOM.hitlSseStatus.style.color = '#00e676'; }
+                }
+            } catch(_){}
+        };
+        es.onerror = () => {
+            if (DOM.hitlSseStatus) { DOM.hitlSseStatus.textContent = '● polling'; DOM.hitlSseStatus.style.color = '#ff9100'; }
+            es.close();
+            // fallback already polling every 15s
+        };
+    } catch(_) {}
+}
+
 function initHITL() {
     DOM.hitlApproveBtn.addEventListener('click', () => handleHITLDecision(true));
     DOM.hitlDenyBtn.addEventListener('click', () => handleHITLDecision(false));
+    if (DOM.hitlSelectAll) DOM.hitlSelectAll.addEventListener('change', (e) => toggleSelectAll(e.target.checked));
+    if (DOM.hitlBatchApprove) DOM.hitlBatchApprove.addEventListener('click', () => handleBatchDecision(true));
+    if (DOM.hitlBatchDeny) DOM.hitlBatchDeny.addEventListener('click', () => handleBatchDecision(false));
+    if (DOM.hitlEscalateBtn) DOM.hitlEscalateBtn.addEventListener('click', async () => {
+        DOM.hitlEscalateBtn.disabled = true;
+        try { await apiFetch('/api/v1/hitl/escalate', {method:'POST'}); await pollPendingHITL(); } catch(_){}
+        DOM.hitlEscalateBtn.disabled = false;
+    });
+}
+
+function updateBatchBar() {
+    const n = STATE.selectedHitlIds.size;
+    if (DOM.hitlBatchApprove) DOM.hitlBatchApprove.disabled = n === 0;
+    if (DOM.hitlBatchDeny) DOM.hitlBatchDeny.disabled = n === 0;
+    if (DOM.hitlSelectAll) {
+        const total = Object.keys(STATE.hitlRequests).length;
+        DOM.hitlSelectAll.checked = total > 0 && n === total;
+        DOM.hitlSelectAll.indeterminate = n > 0 && n < total;
+    }
+}
+
+function toggleSelectAll(checked) {
+    STATE.selectedHitlIds.clear();
+    if (checked) Object.keys(STATE.hitlRequests).forEach(id => STATE.selectedHitlIds.add(id));
+    loadHITLList();
+}
+
+async function handleBatchDecision(approved) {
+    const ids = Array.from(STATE.selectedHitlIds);
+    if (ids.length === 0) return;
+    const btn = approved ? DOM.hitlBatchApprove : DOM.hitlBatchDeny;
+    if (btn) btn.disabled = true;
+    try {
+        const res = await apiFetch('/api/v1/hitl/batch', {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({request_ids: ids, approved, admin_name: 'Admin Panel'})
+        });
+        const data = await res.json();
+        // remove succeeded locally
+        (data.succeeded || []).forEach(id => { delete STATE.hitlRequests[id]; STATE.selectedHitlIds.delete(id); });
+        if (STATE.activeHitlId && !STATE.hitlRequests[STATE.activeHitlId]) { STATE.activeHitlId = null; DOM.hitlDetailView.style.display = 'none'; }
+        await pollPendingHITL();
+        if ((data.failed||[]).length) alert(`Batch partial failure: ${JSON.stringify(data.failed)}`);
+    } catch(e) { console.error(e); alert('Batch failed: '+e.message); }
+    finally { if (btn) btn.disabled = false; updateBatchBar(); }
 }
 
 async function pollPendingHITL() {
     try {
         const res = await apiFetch('/api/v1/hitl/pending');
         STATE.hitlRequests = await res.json();
-        
         const count = Object.keys(STATE.hitlRequests).length;
-        
-        // Update badge counts in menu sidebar
         if (count > 0) {
             DOM.hitlBadge.innerText = count;
             DOM.hitlBadge.style.display = 'block';
         } else {
             DOM.hitlBadge.style.display = 'none';
         }
-
         if (STATE.activeTab === 'hitl') {
             loadHITLList();
         }
@@ -677,9 +762,8 @@ async function pollPendingHITL() {
 function loadHITLList() {
     const listContainer = DOM.hitlRequestsList;
     const reqs = Object.values(STATE.hitlRequests);
-
+    // priority queue already sorted server-side; keep order
     DOM.hitlCountLabel.innerText = `${reqs.length} pending`;
-
     if (reqs.length === 0) {
         listContainer.innerHTML = `
             <div class="empty-state">
@@ -690,57 +774,67 @@ function loadHITLList() {
         `;
         DOM.hitlDetailView.style.display = 'none';
         STATE.activeHitlId = null;
+        STATE.selectedHitlIds.clear();
+        updateBatchBar();
         return;
     }
-
     let html = '';
     reqs.forEach(r => {
         const date = new Date(r.timestamp).toLocaleTimeString();
         const activeClass = STATE.activeHitlId === r.id ? 'active' : '';
-        
+        const checked = STATE.selectedHitlIds.has(r.id) ? 'checked' : '';
+        const prio = getPriorityMeta(r.priority || 0);
+        const overdueBadge = r.is_overdue ? `<span style="background:#ff1744;color:#fff;padding:2px 6px;border-radius:10px;font-size:10px;font-weight:700;margin-left:6px;">OVERDUE</span>` : '';
+        const escalatedBadge = r.is_escalated ? `<span style="background:#b388ff;color:#fff;padding:2px 6px;border-radius:10px;font-size:10px;">ESCALATED</span>` : '';
         html += `
-            <div class="hitl-card ${activeClass}" onclick="selectHITLRequest('${r.id}')">
-                <div class="hitl-card-header">
+            <div class="hitl-card ${activeClass}" style="${r.is_overdue ? 'border-left:3px solid #ff1744;' : ''}">
+                <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+                    <input type="checkbox" ${checked} onclick="event.stopPropagation(); toggleHitlSelect('${r.id}', this.checked)" style="cursor:pointer;">
+                    <span style="background:${prio.bg};color:${prio.color};padding:2px 6px;border-radius:4px;font-size:10px;font-weight:800;letter-spacing:0.5px;">${prio.label}</span>
+                    <span style="font-size:11px;color:var(--text-muted);">risk ${Number(r.risk_score||0).toFixed(2)}</span>
+                    ${overdueBadge}${escalatedBadge}
+                    <span style="margin-left:auto;font-size:11px;color:var(--text-muted);">${escapeHtml(r.assigned_to || 'unassigned')}</span>
+                </div>
+                <div class="hitl-card-header" onclick="selectHITLRequest('${r.id}')" style="cursor:pointer;">
                     <span>User: ${escapeHtml(r.user_id)}</span>
                     <time>${date}</time>
                 </div>
-                <p>${escapeHtml(r.prompt)}</p>
+                <p onclick="selectHITLRequest('${r.id}')" style="cursor:pointer;">${escapeHtml((r.prompt||'').slice(0,160))}</p>
             </div>
         `;
     });
-
     listContainer.innerHTML = html;
-
-    // If there is an active item but it's no longer in queue, hide detail view
     if (STATE.activeHitlId && !STATE.hitlRequests[STATE.activeHitlId]) {
         STATE.activeHitlId = null;
         DOM.hitlDetailView.style.display = 'none';
     }
-
-    // Auto-select the first request if none is selected
     if (!STATE.activeHitlId && reqs.length > 0) {
         selectHITLRequest(reqs[0].id);
     }
+    updateBatchBar();
 }
+
+window.toggleHitlSelect = function(id, checked) {
+    if (checked) STATE.selectedHitlIds.add(id); else STATE.selectedHitlIds.delete(id);
+    updateBatchBar();
+    // update checkbox visual without full rerender
+    loadHITLList();
+};
 
 window.selectHITLRequest = function(id) {
     STATE.activeHitlId = id;
-    
-    // Highlight list card
-    const cards = DOM.hitlRequestsList.querySelectorAll('.hitl-card');
-    cards.forEach(c => {
-        c.classList.remove('active');
-    });
-    
-    // Read list item details
     const req = STATE.hitlRequests[id];
     if (!req) return;
-
-    // Rerender details
     DOM.hitlDetailView.style.display = 'flex';
-    
+    const prio = getPriorityMeta(req.priority || 0);
     const formattedTime = new Date(req.timestamp).toLocaleString();
+    const slaInfo = req.sla_deadline ? `SLA: ${new Date(req.sla_deadline).toLocaleString()} ${req.is_overdue ? '<span style="color:#ff1744;font-weight:700;">(OVERDUE)</span>' : ''}` : '';
     DOM.hitlDetailsBody.innerHTML = `
+        <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center;">
+            <span style="background:${prio.bg};color:${prio.color};padding:4px 10px;border-radius:6px;font-size:12px;font-weight:800;">${prio.label} PRIORITY</span>
+            <span style="font-size:13px;">risk <strong>${Number(req.risk_score||0).toFixed(3)}</strong></span>
+            ${req.is_escalated ? '<span style="background:#b388ff;color:#fff;padding:4px 8px;border-radius:6px;font-size:11px;">ESCALATED</span>' : ''}
+        </div>
         <div class="detail-section">
             <h4>Request Context prompt</h4>
             <p>${escapeHtml(req.prompt)}</p>
@@ -762,6 +856,14 @@ window.selectHITLRequest = function(id) {
                 <span>Request ID</span>
                 <strong><code>${escapeHtml(req.id)}</code></strong>
             </div>
+            <div class="meta-box">
+                <span>Assigned To</span>
+                <strong>${escapeHtml(req.assigned_to || 'unassigned')}</strong>
+            </div>
+            <div class="meta-box">
+                <span>SLA Deadline</span>
+                <strong>${slaInfo || '—'}</strong>
+            </div>
         </div>
         ${req.context ? `
             <div class="detail-section" style="margin-top: 10px;">
@@ -774,24 +876,18 @@ window.selectHITLRequest = function(id) {
 
 async function handleHITLDecision(approved) {
     if (!STATE.activeHitlId) return;
-    
     const id = STATE.activeHitlId;
-    
     try {
         const res = await apiFetch(`/api/v1/hitl/approve/${id}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ approved: approved, admin_name: 'Admin Panel' })
         });
-        
         const data = await res.json();
-        
         if (data.status === 'success') {
-            // Remove locally and redraw
             delete STATE.hitlRequests[id];
+            STATE.selectedHitlIds.delete(id);
             STATE.activeHitlId = null;
-            
-            // Reload list and badge
             pollPendingHITL();
         } else {
             alert(`Approval failed: ${data.detail || 'Unknown error'}`);

@@ -237,6 +237,13 @@
                                 <h2>Pending Approvals</h2>
                                 <span id="hitl-count-label" class="badge-count">0 pending</span>
                             </div>
+                            <div class="hitl-batch-bar" id="hitl-batch-bar" style="display:flex;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border-color);align-items:center;">
+                                <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;"><input type="checkbox" id="hitl-select-all"> Select all</label>
+                                <button class="btn btn-sm btn-success" id="hitl-batch-approve" disabled><i class="fa-solid fa-check-double"></i> Approve selected</button>
+                                <button class="btn btn-sm btn-danger" id="hitl-batch-deny" disabled><i class="fa-solid fa-ban"></i> Deny selected</button>
+                                <button class="btn btn-sm btn-secondary" id="hitl-escalate-btn" title="Escalate overdue"><i class="fa-solid fa-triangle-exclamation"></i> Escalate overdue</button>
+                                <span id="hitl-sse-status" style="margin-left:auto;font-size:11px;color:var(--text-muted);">● live</span>
+                            </div>
                             <div class="hitl-list" id="hitl-requests-list">
                                 <!-- Rendered dynamically -->
                                 <div class="empty-state">

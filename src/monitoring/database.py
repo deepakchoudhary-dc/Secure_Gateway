@@ -108,6 +108,9 @@ class HITLRequest(Base):
     tenant_id = Column(String(100), nullable=True, index=True)
     callback_url = Column(String(500), nullable=True)
     resume_on_approval = Column(Boolean, default=False)
+    priority = Column(Integer, default=0)  # 0=low, 1=medium, 2=high, 3=critical
+    risk_score = Column(Float, default=0.0)
+    sla_deadline = Column(DateTime, nullable=True)
 
 class PolicyConfig(Base):
     __tablename__ = "policy_configs"
