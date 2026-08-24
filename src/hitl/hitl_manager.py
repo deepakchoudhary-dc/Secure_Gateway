@@ -509,14 +509,17 @@ class HITLManager:
         finally:
             session.close()
 
-    def get_completed_history(self, limit: int = 50, offset: int = 0) -> List[Dict]:
+    def get_completed_history(self, limit: int = 50, offset: int = 0, tenant_id: Optional[str] = None) -> List[Dict]:
         """Get completed (approved/denied/timeout) review history."""
         session = SessionLocal()
         try:
+            query = session.query(HITLRequest).filter(
+                HITLRequest.status.in_(["approved", "denied", "timeout"])
+            )
+            if tenant_id:
+                query = query.filter(HITLRequest.tenant_id == tenant_id)
             db_reqs = (
-                session.query(HITLRequest)
-                .filter(HITLRequest.status.in_(["approved", "denied", "timeout"]))
-                .order_by(HITLRequest.decision_at.desc())
+                query.order_by(HITLRequest.decision_at.desc())
                 .offset(offset)
                 .limit(limit)
                 .all()

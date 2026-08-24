@@ -1204,10 +1204,11 @@ async def escalate_hitl():
     return {"escalated": escalated, "count": len(escalated)}
 
 @router.get("/hitl/history", dependencies=[_get_admin_dependency()])
-async def get_hitl_history(limit: int = 50, offset: int = 0):
-    """Get completed HITL review history"""
+async def get_hitl_history(limit: int = 50, offset: int = 0, current_user: CurrentUser = Depends(get_current_user)):
+    """Get completed HITL review history — tenant-scoped for non-admins"""
     hitl_manager = HITLManager()
-    return hitl_manager.get_completed_history(limit=limit, offset=offset)
+    tenant_filter = None if current_user.has_role("admin") else current_user.tenant_id
+    return hitl_manager.get_completed_history(limit=limit, offset=offset, tenant_id=tenant_filter)
 
 
 # Monitoring, Auditing & Logs Endpoints
@@ -1257,14 +1258,17 @@ async def get_security_logs(limit: int = 50, offset: int = 0, action: Optional[s
         session.close()
 
 @router.get("/monitoring/stats", dependencies=[_get_admin_dependency()])
-async def get_dashboard_stats():
-    """Retrieve dashboard statistics & aggregates"""
+async def get_dashboard_stats(current_user: CurrentUser = Depends(get_current_user)):
+    """Retrieve dashboard statistics & aggregates — tenant-scoped for non-admins"""
     session = SessionLocal()
     try:
-        # Aggregations
-        total = session.query(SecurityLog).count()
-        flagged = session.query(SecurityLog).filter(SecurityLog.flagged == True).count()
-        blocked = session.query(SecurityLog).filter(SecurityLog.action_taken.like("blocked%")).count()
+        base_query = session.query(SecurityLog)
+        if not current_user.has_role("admin") and current_user.tenant_id:
+            base_query = base_query.filter(SecurityLog.tenant_id == current_user.tenant_id)
+
+        total = base_query.count()
+        flagged = base_query.filter(SecurityLog.flagged == True).count()
+        blocked = base_query.filter(SecurityLog.action_taken.like("blocked%")).count()
         hitl_pending = session.query(HITLRequest).filter(HITLRequest.status == "pending").count()
         
         # Update gauge

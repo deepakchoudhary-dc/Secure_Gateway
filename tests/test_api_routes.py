@@ -23,8 +23,22 @@ def client():
 
 
 class TestProcessEndpoint:
-    def test_process_normal_request(self, client):
+    def test_process_normal_request(self, client, monkeypatch):
         """Normal prompt should be allowed."""
+        # Deterministic provider: never depend on real network/keys in tests.
+        from src.providers.base import LLMResponse, LLMUsage
+
+        def fake_complete(self, **kwargs):
+            return LLMResponse(
+                content="Paris is the capital of France.",
+                model=kwargs.get("primary_model") or "fake-1",
+                usage=LLMUsage(prompt_tokens=5, completion_tokens=7, total_tokens=12),
+                provider="fake",
+            )
+
+        from src.providers.router_provider import ProviderRouter
+        monkeypatch.setattr(ProviderRouter, "complete", fake_complete)
+
         resp = client.post("/api/v1/process", json={
             "prompt": "What is the capital of France?",
             "user_id": "test_user_1"

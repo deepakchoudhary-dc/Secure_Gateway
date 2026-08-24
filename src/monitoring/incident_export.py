@@ -43,7 +43,7 @@ def export_incident(
             SecurityLog.timestamp <= end_time,
         )
         if tenant_id:
-            query = query.filter(SecurityLog.user_id.like(f"{tenant_id}:%"))
+            query = query.filter(SecurityLog.tenant_id == tenant_id)
 
         logs = query.order_by(SecurityLog.timestamp.asc()).limit(max_records).all()
 

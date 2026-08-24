@@ -113,9 +113,13 @@ class TestTokenBudget:
     def test_check_token_budget_gate(self):
         session = SessionLocal()
         try:
+            # clean prior runs so the suite is order-independent
+            session.query(SecurityLog).filter(SecurityLog.tenant_id == "tenant_burn").delete()
+            session.query(SecurityLog).filter(SecurityLog.tenant_id == "tenant_fresh").delete()
+            session.commit()
             session.add(SecurityLog(
                 prompt="burn", user_id="burner", tenant_id="tenant_burn",
-                total_tokens=900, prompt_tokens=600, completion_tokens=300,
+                total_tokens=1100, prompt_tokens=600, completion_tokens=500,
                 action_taken="allowed", timestamp=datetime.utcnow(),
             ))
             session.commit()
