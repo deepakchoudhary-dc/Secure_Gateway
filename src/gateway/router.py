@@ -539,6 +539,36 @@ async def process_ai_request_impl(
                 "reason": "no retrieved context provided"
             })
 
+        # Step 1D: Sensitive-data gate — stop corporate secrets / bulk PII
+        # BEFORE they reach the LLM or the plaintext audit log.
+        findings = input_filter.scan_sensitive_data(sanitized_prompt, sanitized_context)
+        sensitive_hit = input_filter.evaluate_sensitive_data(findings)
+        if sensitive_hit:
+            action_taken = "blocked_sensitive_data"
+            flagged = True
+            security_score = 0.9
+            response_text = sensitive_hit["reason"]
+            # Never persist the sensitive payload itself.
+            request = request.copy(update={
+                "prompt": "[REDACTED: blocked for sensitive content]",
+                "retrieved_context": None,
+                "context": None,
+                "system_prompt": None,
+            })
+            add_trace("sensitive_data_scan", "blocked", {
+                "matched_kinds": sensitive_hit["kinds"],
+            })
+            anomalies_list.append({
+                "type": "sensitive_data_violation",
+                "description": response_text,
+                "matched_kinds": sensitive_hit["kinds"],
+            })
+            return finalize_response()
+
+        add_trace("sensitive_data_scan", "passed", {
+            "reason": "no sensitive data patterns exceeded thresholds"
+        })
+
         # Step 2: AI-powered Classification (sync HF inference — keep off the event loop)
         classifier = get_classifier()
         classification = await asyncio.to_thread(classifier.classify, sanitized_prompt)

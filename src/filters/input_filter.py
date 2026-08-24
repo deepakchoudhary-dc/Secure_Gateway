@@ -6,7 +6,7 @@ Input/Output Filter Module - Handles input sanitization, RAG context validation,
 import re
 import logging
 import base64
-
+from typing import Any, Dict, Optional
 from ..policy.policy_manager import PolicyManager
 
 logger = logging.getLogger(__name__)
@@ -60,7 +60,16 @@ class InputFilter:
         {"name": "AWS Key ID", "regex": r'AKIA[0-9A-Z]{16}', "replacement": '[REDACTED AWS KEY ID]'},
         {"name": "AWS Secret Access Key", "regex": r'(?i)aws_secret_access_key\s*[:=]\s*[A-Za-z0-9/+=]{40}', "replacement": 'aws_secret_access_key=[REDACTED AWS SECRET]'},
         {"name": "Google Maps API Key", "regex": r'AIza[0-9A-Za-z-_]{35}', "replacement": '[REDACTED GOOGLE KEY]'},
-        {"name": "Google Gemini AQ Key", "regex": r'AQ\.[A-Za-z0-9_-]{30,}', "replacement": '[REDACTED GEMINI KEY]'}
+        {"name": "Google Gemini AQ Key", "regex": r'AQ\.[A-Za-z0-9_-]{30,}', "replacement": '[REDACTED GEMINI KEY]'},
+        {"name": "US SSN", "regex": r'\b\d{3}-\d{2}-\d{4}\b', "replacement": '[REDACTED SSN]'}
+    ]
+
+    # Pattern kinds that always block an inbound request when found: high-precision
+    # credential formats. Everything else is aggregated against max_pii_matches.
+    DEFAULT_BLOCK_KINDS = [
+        "OpenAI API Key", "GitHub Token", "Slack Token", "JWT", "Bearer Token",
+        "Database URL", "AWS Key ID", "AWS Secret Access Key",
+        "Google Maps API Key", "Google Gemini AQ Key", "Credentials/Passwords"
     ]
 
     def __init__(self):
@@ -94,6 +103,12 @@ class InputFilter:
             pii for pii in configured_pii
             if pii.get("name") not in {default["name"] for default in self.DEFAULT_PII_PATTERNS}
         ]
+
+        # Inbound sensitive-data gate (DLP-lite). Policy-overridable.
+        sd = input_rules.get("sensitive_data") or {}
+        self.sensitive_enabled = bool(sd.get("enabled", True))
+        self.max_pii_matches = int(sd.get("max_pii_matches", 8))
+        self.block_kinds = set(sd.get("block_kinds", self.DEFAULT_BLOCK_KINDS))
 
     def sanitize(self, input_text: str) -> str:
         """
@@ -149,6 +164,49 @@ class InputFilter:
         text = re.sub(r'[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]', '', text)
         text = re.sub(r'(?i)\b([a-z])(?:\s+)([a-z])(?:\s+)([a-z])(?:\s+)([a-z])(?:\s+)([a-z])\b', r'\1\2\3\4\5', text)
         return text
+
+    def scan_sensitive_data(self, *texts: str) -> Dict[str, int]:
+        """Count PII/credential pattern matches across the given texts."""
+        findings: Dict[str, int] = {}
+        for text in texts:
+            if not text:
+                continue
+            for pii in self.pii_patterns:
+                name = pii.get("name")
+                try:
+                    n = len(re.findall(pii["regex"], text))
+                except re.error:
+                    continue
+                if n:
+                    findings[name] = findings.get(name, 0) + n
+        return findings
+
+    def evaluate_sensitive_data(self, findings: Dict[str, int]) -> Optional[Dict[str, Any]]:
+        """Decide whether an inbound request carries sensitive/corporate data.
+
+        Returns None when the request is clean; otherwise a dict with a
+        user-safe reason and the matched kinds. Credential-format matches
+        block outright; other PII blocks on aggregate volume.
+        ponytail: regex heuristics with known false-positive/false-negative
+        ceilings — NER/Presidio-class detection is the upgrade path.
+        """
+        if not self.sensitive_enabled or not findings:
+            return None
+
+        cred_hits = sorted(k for k in findings if k in self.block_kinds)
+        if cred_hits:
+            return {
+                "reason": f"Blocked: request contains credential material ({', '.join(cred_hits[:3])}).",
+                "kinds": cred_hits,
+            }
+
+        total_soft = sum(findings.values())
+        if total_soft > self.max_pii_matches:
+            return {
+                "reason": f"Blocked: request appears to contain bulk personal data ({total_soft} matches).",
+                "kinds": sorted(findings),
+            }
+        return None
 
     def is_indirect_injection(self, context_text: str) -> bool:
         """

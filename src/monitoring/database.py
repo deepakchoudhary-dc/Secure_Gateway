@@ -270,9 +270,16 @@ def init_db():
                     logger.error("Failed to update input_validation policy defaults: %s", ex)
             elif input_val_policy:
                 try:
+                    import copy
                     rules = json.loads(input_val_policy.rules_json)
                     configured_patterns = rules.setdefault("block_patterns", [])
                     changed = False
+                    # Backfill rule keys introduced after this DB was seeded
+                    # so policy evolution reaches existing deployments.
+                    for key, val in DEFAULT_POLICY_RULES["input_validation"]["rules"].items():
+                        if key not in rules:
+                            rules[key] = copy.deepcopy(val)
+                            changed = True
                     for pattern in REQUIRED_INPUT_BLOCK_PATTERNS:
                         if pattern not in configured_patterns:
                             configured_patterns.append(pattern)
