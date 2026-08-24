@@ -61,5 +61,17 @@ class LLMProvider(abc.ABC):
     ) -> LLMResponse:
         """Send a completion request and return the response."""
 
+    def stream(
+        self,
+        messages: List[LLMMessage],
+        model: str,
+        temperature: float = 0.2,
+        max_tokens: Optional[int] = None,
+        timeout: float = 30.0,
+    ):
+        """Yield content chunks for streaming. Default falls back to single complete."""
+        response = self.complete(messages, model, temperature, max_tokens, timeout)
+        yield response.content
+
     def validate_response(self, raw: Dict[str, Any]) -> None:
         """Optional hook to validate raw API response schema before parsing."""

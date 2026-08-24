@@ -23,6 +23,20 @@ class MockProvider(LLMProvider):
     def name(self) -> str:
         return "mock"
 
+    def stream(
+        self,
+        messages: List[LLMMessage],
+        model: str = "mock-model",
+        temperature: float = 0.2,
+        max_tokens: Optional[int] = None,
+        timeout: float = 30.0,
+    ):
+        # ponytail: chunk the canned response to exercise the streaming pipeline without network
+        resp = self.complete(messages, model, temperature, max_tokens, timeout)
+        chunk = 12
+        for i in range(0, len(resp.content), chunk):
+            yield resp.content[i:i+chunk]
+
     def complete(
         self,
         messages: List[LLMMessage],

@@ -170,3 +170,14 @@ class AIClassifier:
                 detection["score"] = max(detection["score"], weight)
 
         return detection
+
+
+# Module-level cached classifier to avoid repeated heavy model loads per-request
+_cached_classifier = {"stamp": None, "inst": None}
+
+
+def get_ai_classifier() -> AIClassifier:
+    # Cache the classifier instance. If the instance is missing, create it lazily.
+    if _cached_classifier["inst"] is None:
+        _cached_classifier["inst"] = AIClassifier()
+    return _cached_classifier["inst"]

@@ -164,6 +164,51 @@ class ProviderRouter:
                 f"Both primary and fallback providers failed. Last: {exc}", retryable=False
             )
 
+    def stream(
+        self,
+        messages: List[LLMMessage],
+        primary_provider_type: str,
+        primary_url: str,
+        primary_key: str,
+        primary_model: str,
+        fallback_enabled: bool = False,
+        fallback_provider_type: str = "mock",
+        fallback_url: str = "",
+        fallback_key: str = "",
+        fallback_model: str = "",
+    ):
+        """Yield content chunks, honoring the same CB/egress rules as complete."""
+        if primary_provider_type != "mock" and primary_url:
+            self._check_egress(primary_url)
+        primary = self.get_provider(primary_provider_type, primary_url, primary_key, primary_model)
+        breaker = self._get_breaker(f"primary:{primary_provider_type}")
+        try:
+            breaker.check()
+            yielded = False
+            for chunk in primary.stream(messages, primary_model, timeout=self._request_timeout):
+                yielded = True
+                yield chunk
+            if yielded:
+                breaker.record_success()
+                return
+            breaker.record_success()
+        except CircuitBreakerOpen as exc:
+            logger.warning("Primary circuit open (stream): %s", exc)
+        except ProviderError as exc:
+            breaker.record_failure()
+            logger.error("Primary stream failed: %s", exc)
+        if not fallback_enabled:
+            raise ProviderError("Primary stream failed and no fallback is configured", retryable=False)
+        logger.warning("Failing over stream to fallback: %s", fallback_provider_type)
+        if fallback_provider_type != "mock" and fallback_url:
+            self._check_egress(fallback_url)
+        fallback = self.get_provider(fallback_provider_type, fallback_url, fallback_key, fallback_model)
+        fb_breaker = self._get_breaker(f"fallback:{fallback_provider_type}")
+        fb_breaker.check()
+        for chunk in fallback.stream(messages, fallback_model, timeout=self._request_timeout):
+            yield chunk
+        fb_breaker.record_success()
+
     def get_circuit_states(self) -> Dict[str, dict]:
         """Return current circuit breaker states for observability."""
         return {name: cb.to_dict() for name, cb in self._breakers.items()}

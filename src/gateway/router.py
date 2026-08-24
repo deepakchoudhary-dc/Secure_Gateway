@@ -10,6 +10,8 @@ import json
 import secrets
 from urllib.parse import urlparse
 from fastapi import APIRouter, HTTPException, Depends, Header, status, Response
+from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, validator
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
@@ -245,6 +247,197 @@ async def process_ai_request(
         current_user=current_user,
         idempotency_key=idempotency_key,
     )
+
+
+@router.post("/process/stream")
+async def process_ai_stream(
+    request: AIRequest,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Streaming gateway — input guards run once, then LLM tokens stream
+    with per-token hold-back PII scanning and kill-switch. Falls back
+    to chunked-complete for providers that do not support SSE.
+    """
+    # ── Reuse the same Stage 0–4 guards as the non-streaming path ──
+    # We inline the checks rather than calling process_ai_request_impl
+    # (which would already have called the LLM non-streaming).
+    start_time = time.time()
+    request_id = get_request_id() or set_request_id()
+    metrics = get_metrics()
+    metrics.inc("requests_total")
+
+    session = SessionLocal()
+    try:
+        gw_config = session.query(GatewayConfig).first()
+    except Exception as db_err:
+        logger.error(f"Failed to fetch config from database: {db_err}")
+        gw_config = None
+    finally:
+        session.close()
+    allowed_topics_str = gw_config.allowed_topics if gw_config else ""
+    tenant_id = current_user.tenant_id
+
+    # Fast-path blocked streaming: run guards, return single SSE frame
+    async def _guarded_stream():
+        policy_manager = PolicyManager()
+        filt = get_input_filter()
+
+        # 0A rate limit
+        rl = policy_manager.check_rate_limit(request.user_id)
+        if not rl.get("allowed", True):
+            yield f"data: {json.dumps({'action': 'blocked_rate_limit', 'response': rl.get('reason', ''), 'done': True})}\n\n"
+            return
+        # 0B access
+        ac = policy_manager.check_user_access(request.user_id, request.model, current_user.roles)
+        if not ac.get("allowed", True):
+            yield f"data: {json.dumps({'action': 'blocked_access_violation', 'response': ac.get('reason', ''), 'done': True})}\n\n"
+            return
+        # 0C token budget
+        daily_token_limit = getattr(settings, "TENANT_DAILY_TOKEN_LIMIT", 0)
+        if daily_token_limit > 0:
+            br = await asyncio.to_thread(policy_manager.check_token_budget, tenant_id, daily_token_limit)
+            if not br.get("allowed", True):
+                yield f"data: {json.dumps({'action': 'blocked_token_budget', 'response': br.get('reason', ''), 'done': True})}\n\n"
+                return
+
+        sanitized_prompt = filt.sanitize(request.prompt)
+        sanitized_context = None
+        if allowed_topics_str and filt.is_out_of_topic(sanitized_prompt, allowed_topics_str):
+            yield f"data: {json.dumps({'action': 'blocked_topic_violation', 'response': f'Blocked: out-of-scope. Allowed: {allowed_topics_str}.', 'done': True})}\n\n"
+            return
+        if filt.is_malicious(request.prompt) or filt.is_malicious(sanitized_prompt):
+            yield f"data: {json.dumps({'action': 'blocked_input', 'response': 'Blocked: input security policy.', 'done': True})}\n\n"
+            return
+        # semantic
+        input_policies = policy_manager.policies.get("input_validation")
+        if input_policies and input_policies.enabled:
+            rules = input_policies.rules
+            templates = rules.get("jailbreak_templates", [])
+            threshold = rules.get("semantic_threshold", 0.65)
+            if templates:
+                learned = await asyncio.to_thread(get_learned_malicious_prompts, tenant_id)
+                templates = [*templates, *learned]
+                feedback_epoch = await asyncio.to_thread(get_feedback_epoch)
+                detector = get_fitted_detector(templates, feedback_epoch)
+                sem_result = await asyncio.to_thread(detector.check_similarity, sanitized_prompt, threshold)
+                if sem_result["flagged"]:
+                    yield f"data: {json.dumps({'action': 'blocked_semantic_jailbreak', 'response': sem_result['matched_pattern'], 'done': True})}\n\n"
+                    return
+
+        # RAG injection
+        if request.retrieved_context:
+            sanitized_context = filt.sanitize(request.retrieved_context)
+            if filt.is_indirect_injection(sanitized_context):
+                yield f"data: {json.dumps({'action': 'blocked_indirect_injection', 'done': True})}\n\n"
+                return
+        # sensitive data
+        findings = filt.scan_sensitive_data(sanitized_prompt, sanitized_context)
+        hit = filt.evaluate_sensitive_data(findings)
+        if hit:
+            yield f"data: {json.dumps({'action': 'blocked_sensitive_data', 'response': hit['reason'], 'done': True})}\n\n"
+            return
+        # classification + policy -> HITL
+        classifier = get_classifier()
+        classification = await asyncio.to_thread(classifier.classify, sanitized_prompt)
+        if not policy_manager.check_policy(request.user_id, classification):
+            yield f"data: {json.dumps({'action': 'hitl_pending', 'response': 'Pending human review.', 'done': True})}\n\n"
+            return
+        # sandbox
+        code_snippet = extract_python_code(sanitized_prompt)
+        if request.execute_code and code_snippet:
+            sandbox = SandboxManager()
+            sandbox_res = await asyncio.to_thread(sandbox.execute_code, code_snippet, "python")
+            if not sandbox_res.get("success", False):
+                yield f"data: {json.dumps({'action': 'blocked_sandbox_violation', 'response': sandbox_res.get('error', ''), 'done': True})}\n\n"
+                return
+            text = f"Code executed.\n[OUTPUT]\n{sandbox_res.get('output','')}"
+            # stream the sandbox output with same hold-back
+            buffer = ""
+            for i in range(0, len(text), 80):
+                chunk = text[i:i+80]
+                scan_text = buffer + chunk
+                redacted = filt.filter_output(scan_text)
+                if redacted != scan_text:
+                    yield f"data: {json.dumps({'chunk': redacted[:len(scan_text)-len(buffer)], 'pii_detected': True})}\n\n"
+                    yield f"data: {json.dumps({'done': True, 'action': 'redacted_stream'})}\n\n"
+                    return
+                if len(scan_text) > 50:
+                    emit = scan_text[:-50]
+                    buffer = scan_text[-50:]
+                    yield f"data: {json.dumps({'chunk': emit})}\n\n"
+                else:
+                    buffer = scan_text
+                await asyncio.sleep(0)
+            if buffer:
+                yield f"data: {json.dumps({'chunk': buffer})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'action': 'allowed'})}\n\n"
+            return
+
+        # ── Live LLM streaming with per-token hold-back ──
+        sm = get_secrets_manager()
+        primary_key = sm.get_secret(gw_config.primary_key, actor=current_user.subject, tenant_id=tenant_id) if gw_config and gw_config.primary_key else ""
+        pr = get_provider_router()
+        messages = []
+        if request.system_prompt:
+            messages.append(LLMMessage(role="system", content=request.system_prompt))
+        if request.retrieved_context and sanitized_context:
+            messages.append(LLMMessage(role="user", content=f"<retrieved_context untrusted=\"true\">\n{sanitized_context}\n</retrieved_context>"))
+        messages.append(LLMMessage(role="user", content=sanitized_prompt))
+
+        # ponytail: hold-back buffer catches PII split across token boundaries; 50 chars is ~10 tokens
+        buffer = ""
+        hold_back = 50
+        full_response = []
+        try:
+            for token in pr.stream(
+                messages=messages,
+                primary_provider_type=gw_config.primary_provider if gw_config else "mock",
+                primary_url=gw_config.primary_url if gw_config else "",
+                primary_key=primary_key,
+                primary_model=gw_config.primary_model if gw_config else "mock",
+                fallback_enabled=gw_config.fallback_enabled if gw_config else False,
+                fallback_provider_type=gw_config.fallback_provider if gw_config else "mock",
+                fallback_url=gw_config.fallback_url if gw_config else "",
+                fallback_key=sm.get_secret(gw_config.fallback_key, actor=current_user.subject, tenant_id=tenant_id) if gw_config and gw_config.fallback_key else "",
+                fallback_model=gw_config.fallback_model if gw_config else "",
+            ):
+                scan_text = buffer + token
+                redacted = filt.filter_output(scan_text)
+                if redacted != scan_text:
+                    yield f"data: {json.dumps({'chunk': redacted[:len(scan_text)-len(buffer)], 'pii_detected': True})}\n\n"
+                    yield f"data: {json.dumps({'done': True, 'action': 'redacted_stream'})}\n\n"
+                    return
+                if len(scan_text) > hold_back:
+                    emit = scan_text[:-hold_back]
+                    buffer = scan_text[-hold_back:]
+                    full_response.append(emit)
+                    yield f"data: {json.dumps({'chunk': emit})}\n\n"
+                else:
+                    buffer = scan_text
+                await asyncio.sleep(0)
+            if buffer:
+                # final output-leak guard on the tail
+                if request.system_prompt and filt.detect_system_leak(buffer, request.system_prompt):
+                    yield f"data: {json.dumps({'done': True, 'action': 'blocked_system_leak'})}\n\n"
+                    return
+                full_response.append(buffer)
+                yield f"data: {json.dumps({'chunk': buffer})}\n\n"
+            # log the streamed transaction (best-effort, no token counts mid-stream)
+            try:
+                log_transaction(user_id=request.user_id, prompt=request.prompt, response="".join(full_response),
+                                risk_score=classification.get("score", 0.0) if 'classification' in locals() else 0.0,
+                                flagged=False, duration=time.time()-start_time, anomalies=[], action_taken="allowed",
+                                system_prompt=request.system_prompt, retrieved_context=request.retrieved_context,
+                                trace=[{"stage": "streaming", "status": "complete", "request_id": request_id, "details": {}}],
+                                tenant_id=tenant_id)
+            except Exception:
+                pass
+            yield f"data: {json.dumps({'done': True, 'action': 'allowed'})}\n\n"
+        except Exception as exc:
+            yield f"data: {json.dumps({'done': True, 'action': 'blocked_network_error', 'error': str(exc)})}\n\n"
+
+    return StreamingResponse(_guarded_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 async def process_ai_request_impl(
@@ -930,33 +1123,30 @@ async def update_policies(update: PolicyUpdate):
 
 # Human-in-the-Loop endpoints
 @router.get("/hitl/pending", dependencies=[_get_admin_dependency()])
-async def get_hitl_pending():
-    """Fetch all pending manual approvals — priority queue sorted, SLA auto-escalated"""
+async def get_hitl_pending(current_user: CurrentUser = Depends(get_current_user)):
+    """Fetch all pending manual approvals — priority queue sorted, SLA auto-escalated, tenant-scoped"""
     hitl_manager = HITLManager()
-    # ponytail: lazy SLA check on read — no cron needed; keeps DB writes on read path minimal
     try:
         hitl_manager.escalate_overdue()
     except Exception:
         pass
-    return hitl_manager.get_pending_requests()
+    tenant_filter = None if current_user.has_role("admin") else current_user.tenant_id
+    return hitl_manager.get_pending_requests(tenant_id=tenant_filter)
 
 @router.get("/hitl/events", dependencies=[_get_admin_dependency()])
-async def hitl_events():
-    """SSE stream for HITL queue live updates — replaces polling pollPendingHITL every 5s"""
-    from fastapi.responses import StreamingResponse
-
+async def hitl_events(current_user: CurrentUser = Depends(get_current_user)):
+    """SSE stream for HITL queue live updates"""
+    tenant_filter = None if current_user.has_role("admin") else current_user.tenant_id
     async def event_gen():
         last_payload = None
-        # ponytail: poll DB every 2s, push only on change — minimal, no extra deps (websockets)
         while True:
             try:
                 mgr = HITLManager()
-                # keep SLA fresh while streaming
                 try:
                     mgr.escalate_overdue()
                 except Exception:
                     pass
-                pending = mgr.get_pending_requests()
+                pending = mgr.get_pending_requests(tenant_id=tenant_filter)
                 payload = json.dumps({"pending": pending, "count": len(pending)})
                 if payload != last_payload:
                     last_payload = payload
@@ -966,7 +1156,6 @@ async def hitl_events():
             except Exception as e:
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
             await asyncio.sleep(2)
-
     return StreamingResponse(event_gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 @router.post("/hitl/approve/{request_id}", dependencies=[_get_admin_dependency()])
@@ -1023,11 +1212,13 @@ async def get_hitl_history(limit: int = 50, offset: int = 0):
 
 # Monitoring, Auditing & Logs Endpoints
 @router.get("/monitoring/logs", dependencies=[_get_admin_dependency()])
-async def get_security_logs(limit: int = 50, offset: int = 0, action: Optional[str] = None):
-    """Retrieve security transaction logs from SQLite"""
+async def get_security_logs(limit: int = 50, offset: int = 0, action: Optional[str] = None, current_user: CurrentUser = Depends(get_current_user)):
+    """Retrieve security transaction logs from SQLite — tenant-scoped for non-admins"""
     session = SessionLocal()
     try:
         query = session.query(SecurityLog)
+        if not current_user.has_role("admin") and current_user.tenant_id:
+            query = query.filter(SecurityLog.tenant_id == current_user.tenant_id)
         if action:
             query = query.filter(SecurityLog.action_taken == action)
         

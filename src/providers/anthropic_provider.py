@@ -91,6 +91,44 @@ class AnthropicProvider(LLMProvider):
         self.validate_response(raw)
         return self._parse_response(raw, model, latency)
 
+    def stream(self, messages, model="", temperature=0.2, max_tokens=None, timeout=30.0):
+        import json as _json
+        model = model or self._default_model
+        system_text = ""
+        api_messages = []
+        for m in messages:
+            if m.role == "system":
+                system_text = m.content
+            else:
+                api_messages.append({"role": m.role, "content": m.content})
+        if not api_messages:
+            raise ProviderError("At least one non-system message is required", retryable=False)
+        payload: Dict[str, Any] = {"model": model, "messages": api_messages, "temperature": temperature, "max_tokens": max_tokens or 4096, "stream": True}
+        if system_text:
+            payload["system"] = system_text
+        try:
+            with self._session.post(self._base_url, json=payload, timeout=timeout, stream=True, allow_redirects=False) as resp:
+                if resp.status_code != 200:
+                    raise ProviderError(f"Anthropic API error {resp.status_code}: {resp.text[:500]}", status_code=resp.status_code, retryable=resp.status_code not in _NON_RETRYABLE_STATUS)
+                for line in resp.iter_lines(decode_unicode=True):
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        raw = _json.loads(data)
+                        if raw.get("type") == "content_block_delta":
+                            delta = raw.get("delta", {}).get("text")
+                            if delta:
+                                yield delta
+                    except Exception:
+                        continue
+        except ProviderError:
+            raise
+        except Exception:
+            yield from super().stream(messages, model, temperature, max_tokens, timeout)
+
     def validate_response(self, raw: Dict[str, Any]) -> None:
         if "content" not in raw:
             raise ProviderError("Response missing 'content' field", retryable=False)

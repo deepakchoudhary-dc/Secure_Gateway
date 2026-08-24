@@ -72,6 +72,49 @@ class OpenAIProvider(LLMProvider):
         self.validate_response(raw)
         return self._parse_response(raw, model, latency)
 
+    def stream(
+        self,
+        messages: List[LLMMessage],
+        model: str = "",
+        temperature: float = 0.2,
+        max_tokens: Optional[int] = None,
+        timeout: float = 30.0,
+    ):
+        """SSE streaming via OpenAI chat completions `stream=True`."""
+        import json as _json
+        model = model or self._default_model
+        payload: Dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "temperature": temperature,
+            "stream": True,
+        }
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+        try:
+            with self._session.post(self._base_url, json=payload, timeout=timeout, stream=True, allow_redirects=False) as resp:
+                if resp.status_code != 200:
+                    retryable = resp.status_code not in _NON_RETRYABLE_STATUS
+                    raise ProviderError(f"OpenAI API error {resp.status_code}: {resp.text[:500]}", status_code=resp.status_code, retryable=retryable)
+                for line in resp.iter_lines(decode_unicode=True):
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        raw = _json.loads(data)
+                        delta = raw.get("choices", [{}])[0].get("delta", {}).get("content")
+                        if delta:
+                            yield delta
+                    except Exception:
+                        continue
+        except ProviderError:
+            raise
+        except Exception as exc:
+            # ponytail: streaming fallback — if SSE fails, single complete still works
+            yield from super().stream(messages, model, temperature, max_tokens, timeout)
+
     def validate_response(self, raw: Dict[str, Any]) -> None:
         if "choices" not in raw:
             raise ProviderError("Response missing 'choices' field", retryable=False)

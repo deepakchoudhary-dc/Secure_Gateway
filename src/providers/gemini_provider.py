@@ -160,6 +160,54 @@ class GeminiProvider(LLMProvider):
         self.validate_response(raw)
         return self._parse_response(raw, model, latency)
 
+    def stream(self, messages, model="", temperature=0.2, max_tokens=None, timeout=30.0):
+        target_model = (model or self._default_model).replace("models/", "")
+        # reuse OpenAI-compat SSE when configured, else native streamGenerateContent
+        if self._base_url and "openai" in self._base_url:
+            yield from super().stream(messages, target_model, temperature, max_tokens, timeout)
+            return
+        import json as _json
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:streamGenerateContent?alt=sse"
+        headers = {"Content-Type": "application/json", "x-goog-api-key": self._api_key}
+        if not self._api_key.startswith("AIza"):
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        system_instruction = None
+        contents = []
+        for m in messages:
+            if m.role == "system":
+                system_instruction = {"parts": [{"text": m.content}]}
+            else:
+                role = "user" if m.role == "user" else "model"
+                contents.append({"role": role, "parts": [{"text": m.content}]})
+        payload: Dict[str, Any] = {"contents": contents, "generationConfig": {"temperature": temperature}}
+        if system_instruction:
+            payload["systemInstruction"] = system_instruction
+        if max_tokens is not None:
+            payload["generationConfig"]["maxOutputTokens"] = max_tokens
+        try:
+            with self._session.post(url, headers=headers, json=payload, timeout=timeout, stream=True, allow_redirects=True) as resp:
+                if resp.status_code != 200:
+                    raise ProviderError(f"Gemini API error {resp.status_code}: {resp.text[:500]}", status_code=resp.status_code, retryable=resp.status_code not in _NON_RETRYABLE_STATUS)
+                for line in resp.iter_lines(decode_unicode=True):
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if not data:
+                        continue
+                    try:
+                        raw = _json.loads(data)
+                        for cand in raw.get("candidates", []):
+                            for part in cand.get("content", {}).get("parts", []):
+                                t = part.get("text")
+                                if t:
+                                    yield t
+                    except Exception:
+                        continue
+        except ProviderError:
+            raise
+        except Exception:
+            yield from super().stream(messages, target_model, temperature, max_tokens, timeout)
+
     def validate_response(self, raw: Dict[str, Any]) -> None:
         if "candidates" not in raw or not raw["candidates"]:
             raise ProviderError("Gemini response missing 'candidates'", retryable=False)

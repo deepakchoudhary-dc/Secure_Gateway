@@ -347,11 +347,13 @@ class HITLManager:
         finally:
             session.close()
 
-    def get_pending_requests(self, sort_by_priority: bool = True) -> Dict[str, Dict]:
-        """Get all pending approval requests from DB, priority queue sorted"""
+    def get_pending_requests(self, sort_by_priority: bool = True, tenant_id: Optional[str] = None) -> Dict[str, Dict]:
+        """Get all pending approval requests from DB, priority queue sorted, tenant-scoped if needed"""
         session = SessionLocal()
         try:
             query = session.query(HITLRequest).filter(HITLRequest.status == "pending")
+            if tenant_id:
+                query = query.filter(HITLRequest.tenant_id == tenant_id)
             if sort_by_priority and getattr(settings, "HITL_PRIORITY_ENABLED", True):
                 query = query.order_by(HITLRequest.priority.desc(), HITLRequest.created_at.asc())
             else:

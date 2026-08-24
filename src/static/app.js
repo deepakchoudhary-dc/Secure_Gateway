@@ -2,31 +2,6 @@
  * AI Security Gateway - Frontend Application Controller
  */
 
-// Credentials are entered once per browser session and never stored in code.
-// ponytail: prompt()-based login is minimal; upgrade path is a proper login
-// view issuing a short-lived JWT session.
-function getCredential(headerName, label) {
-    const key = 'gw_' + headerName;
-    let value = sessionStorage.getItem(key);
-    if (!value) {
-        value = window.prompt('Gateway ' + label + ':') || '';
-        sessionStorage.setItem(key, value);
-    }
-    return value;
-}
-
-// Helper for API fetch with admin auth header
-async function apiFetch(url, options = {}) {
-    options.headers = options.headers || {};
-    if (!options.headers['X-Admin-Token'] && !options.headers['x-admin-token']) {
-        options.headers['X-Admin-Token'] = getCredential('admin-token', 'admin token');
-    }
-    if (!options.headers['X-API-Key'] && !options.headers['x-api-key']) {
-        options.headers['X-API-Key'] = getCredential('api-key', 'API key');
-    }
-    return fetch(url, options);
-}
-
 // Application State
 const STATE = {
     activeTab: 'overview',
@@ -272,7 +247,7 @@ function initOverview() {
 
 async function fetchStats() {
     try {
-        const res = await apiFetch('/api/v1/monitoring/stats');
+        const res = await fetch('/api/v1/monitoring/stats');
         const data = await res.json();
         
         DOM.statTotalProcessed.innerText = data.total_requests;
@@ -293,7 +268,7 @@ async function fetchStats() {
 
 async function fetchRecentIncidents() {
     try {
-        const res = await apiFetch('/api/v1/monitoring/logs?limit=5');
+        const res = await fetch('/api/v1/monitoring/logs?limit=5');
         const logs = await res.json();
         
         let html = '';
@@ -490,7 +465,7 @@ function initPolicies() {
 
 async function fetchPolicies() {
     try {
-        const res = await apiFetch('/api/v1/policies');
+        const res = await fetch('/api/v1/policies');
         STATE.policies = await res.json();
         
         // If we are currently displaying Policy page, refresh inputs
@@ -501,7 +476,6 @@ async function fetchPolicies() {
         console.error("Failed to fetch policies", e);
     }
 }
-
 
 function renderActivePolicyForm() {
     const policy = STATE.policies[STATE.activePolicyName];
@@ -530,7 +504,7 @@ function renderActivePolicyForm() {
             </div>
             <div class="form-group">
                 <label for="rule-block-patterns">Prohibited prompt patterns (One per line):</label>
-                <textarea id="rule-block-patterns" rows="5">${escapeHtml((rules.block_patterns || []).join('\n'))}</textarea>
+                <textarea id="rule-block-patterns" rows="5">${(rules.block_patterns || []).join('\n')}</textarea>
             </div>
         `;
     } else if (STATE.activePolicyName === 'content_filtering') {
@@ -541,11 +515,11 @@ function renderActivePolicyForm() {
             </div>
             <div class="form-group">
                 <label for="rule-block-categories">Violent/Harmful Block Categories (Comma-separated):</label>
-                <input type="text" id="rule-block-categories" value="${escapeHtml((rules.block_categories || []).join(', '))}">
+                <input type="text" id="rule-block-categories" value="${(rules.block_categories || []).join(', ')}">
             </div>
             <div class="form-group">
                 <label for="rule-allow-domains">Approved Knowledge domains (Comma-separated):</label>
-                <input type="text" id="rule-allow-domains" value="${escapeHtml((rules.allow_domains || []).join(', '))}">
+                <input type="text" id="rule-allow-domains" value="${(rules.allow_domains || []).join(', ')}">
             </div>
         `;
     } else if (STATE.activePolicyName === 'rate_limiting') {
@@ -567,7 +541,7 @@ function renderActivePolicyForm() {
         html = `
             <div class="form-group">
                 <label>Access Roles Permissions Configuration:</label>
-                <textarea id="rule-roles-json" rows="8" style="font-family: monospace;">${escapeHtml(JSON.stringify(rules.roles || {}, null, 2))}</textarea>
+                <textarea id="rule-roles-json" rows="8" style="font-family: monospace;">${JSON.stringify(rules.roles || {}, null, 2)}</textarea>
             </div>
         `;
     }
@@ -622,7 +596,7 @@ async function saveActivePolicy() {
             }
         };
 
-        const res = await apiFetch('/api/v1/policies', {
+        const res = await fetch('/api/v1/policies', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
@@ -652,105 +626,28 @@ async function saveActivePolicy() {
 }
 
 // -----------------------------------------------------
-// 3. HUMAN-IN-THE-LOOP (HITL) WORKFLOW — priority queue, batch, SLA, SSE
+// 3. HUMAN-IN-THE-LOOP (HITL) WORKFLOW
 // -----------------------------------------------------
-function getPriorityMeta(p) {
-    const map = {
-        3: {label:'CRITICAL', color:'#ff1744', bg:'rgba(255,23,68,0.15)'},
-        2: {label:'HIGH', color:'#ff9100', bg:'rgba(255,145,0,0.15)'},
-        1: {label:'MEDIUM', color:'#ffd600', bg:'rgba(255,214,0,0.15)'},
-        0: {label:'LOW', color:'#00e676', bg:'rgba(0,230,118,0.12)'}
-    };
-    return map[p] || map[0];
-}
-
-function connectHitlSSE() {
-    try {
-        const es = new EventSource('/api/v1/hitl/events');
-        STATE.hitlEventSource = es;
-        es.onmessage = (e) => {
-            try {
-                const data = JSON.parse(e.data);
-                if (data.pending) {
-                    STATE.hitlRequests = data.pending;
-                    const count = Object.keys(STATE.hitlRequests).length;
-                    if (count > 0) { DOM.hitlBadge.innerText = count; DOM.hitlBadge.style.display = 'block'; }
-                    else { DOM.hitlBadge.style.display = 'none'; }
-                    if (STATE.activeTab === 'hitl') loadHITLList();
-                    if (DOM.hitlSseStatus) { DOM.hitlSseStatus.textContent = '● live'; DOM.hitlSseStatus.style.color = '#00e676'; }
-                }
-            } catch(_){}
-        };
-        es.onerror = () => {
-            if (DOM.hitlSseStatus) { DOM.hitlSseStatus.textContent = '● polling'; DOM.hitlSseStatus.style.color = '#ff9100'; }
-            es.close();
-            // fallback already polling every 15s
-        };
-    } catch(_) {}
-}
-
 function initHITL() {
     DOM.hitlApproveBtn.addEventListener('click', () => handleHITLDecision(true));
     DOM.hitlDenyBtn.addEventListener('click', () => handleHITLDecision(false));
-    if (DOM.hitlSelectAll) DOM.hitlSelectAll.addEventListener('change', (e) => toggleSelectAll(e.target.checked));
-    if (DOM.hitlBatchApprove) DOM.hitlBatchApprove.addEventListener('click', () => handleBatchDecision(true));
-    if (DOM.hitlBatchDeny) DOM.hitlBatchDeny.addEventListener('click', () => handleBatchDecision(false));
-    if (DOM.hitlEscalateBtn) DOM.hitlEscalateBtn.addEventListener('click', async () => {
-        DOM.hitlEscalateBtn.disabled = true;
-        try { await apiFetch('/api/v1/hitl/escalate', {method:'POST'}); await pollPendingHITL(); } catch(_){}
-        DOM.hitlEscalateBtn.disabled = false;
-    });
-}
-
-function updateBatchBar() {
-    const n = STATE.selectedHitlIds.size;
-    if (DOM.hitlBatchApprove) DOM.hitlBatchApprove.disabled = n === 0;
-    if (DOM.hitlBatchDeny) DOM.hitlBatchDeny.disabled = n === 0;
-    if (DOM.hitlSelectAll) {
-        const total = Object.keys(STATE.hitlRequests).length;
-        DOM.hitlSelectAll.checked = total > 0 && n === total;
-        DOM.hitlSelectAll.indeterminate = n > 0 && n < total;
-    }
-}
-
-function toggleSelectAll(checked) {
-    STATE.selectedHitlIds.clear();
-    if (checked) Object.keys(STATE.hitlRequests).forEach(id => STATE.selectedHitlIds.add(id));
-    loadHITLList();
-}
-
-async function handleBatchDecision(approved) {
-    const ids = Array.from(STATE.selectedHitlIds);
-    if (ids.length === 0) return;
-    const btn = approved ? DOM.hitlBatchApprove : DOM.hitlBatchDeny;
-    if (btn) btn.disabled = true;
-    try {
-        const res = await apiFetch('/api/v1/hitl/batch', {
-            method: 'POST',
-            headers: {'Content-Type':'application/json'},
-            body: JSON.stringify({request_ids: ids, approved, admin_name: 'Admin Panel'})
-        });
-        const data = await res.json();
-        // remove succeeded locally
-        (data.succeeded || []).forEach(id => { delete STATE.hitlRequests[id]; STATE.selectedHitlIds.delete(id); });
-        if (STATE.activeHitlId && !STATE.hitlRequests[STATE.activeHitlId]) { STATE.activeHitlId = null; DOM.hitlDetailView.style.display = 'none'; }
-        await pollPendingHITL();
-        if ((data.failed||[]).length) alert(`Batch partial failure: ${JSON.stringify(data.failed)}`);
-    } catch(e) { console.error(e); alert('Batch failed: '+e.message); }
-    finally { if (btn) btn.disabled = false; updateBatchBar(); }
 }
 
 async function pollPendingHITL() {
     try {
-        const res = await apiFetch('/api/v1/hitl/pending');
+        const res = await fetch('/api/v1/hitl/pending');
         STATE.hitlRequests = await res.json();
+        
         const count = Object.keys(STATE.hitlRequests).length;
+        
+        // Update badge counts in menu sidebar
         if (count > 0) {
             DOM.hitlBadge.innerText = count;
             DOM.hitlBadge.style.display = 'block';
         } else {
             DOM.hitlBadge.style.display = 'none';
         }
+
         if (STATE.activeTab === 'hitl') {
             loadHITLList();
         }
@@ -762,8 +659,9 @@ async function pollPendingHITL() {
 function loadHITLList() {
     const listContainer = DOM.hitlRequestsList;
     const reqs = Object.values(STATE.hitlRequests);
-    // priority queue already sorted server-side; keep order
+
     DOM.hitlCountLabel.innerText = `${reqs.length} pending`;
+
     if (reqs.length === 0) {
         listContainer.innerHTML = `
             <div class="empty-state">
@@ -774,67 +672,57 @@ function loadHITLList() {
         `;
         DOM.hitlDetailView.style.display = 'none';
         STATE.activeHitlId = null;
-        STATE.selectedHitlIds.clear();
-        updateBatchBar();
         return;
     }
+
     let html = '';
     reqs.forEach(r => {
         const date = new Date(r.timestamp).toLocaleTimeString();
         const activeClass = STATE.activeHitlId === r.id ? 'active' : '';
-        const checked = STATE.selectedHitlIds.has(r.id) ? 'checked' : '';
-        const prio = getPriorityMeta(r.priority || 0);
-        const overdueBadge = r.is_overdue ? `<span style="background:#ff1744;color:#fff;padding:2px 6px;border-radius:10px;font-size:10px;font-weight:700;margin-left:6px;">OVERDUE</span>` : '';
-        const escalatedBadge = r.is_escalated ? `<span style="background:#b388ff;color:#fff;padding:2px 6px;border-radius:10px;font-size:10px;">ESCALATED</span>` : '';
+        
         html += `
-            <div class="hitl-card ${activeClass}" style="${r.is_overdue ? 'border-left:3px solid #ff1744;' : ''}">
-                <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
-                    <input type="checkbox" ${checked} onclick="event.stopPropagation(); toggleHitlSelect('${r.id}', this.checked)" style="cursor:pointer;">
-                    <span style="background:${prio.bg};color:${prio.color};padding:2px 6px;border-radius:4px;font-size:10px;font-weight:800;letter-spacing:0.5px;">${prio.label}</span>
-                    <span style="font-size:11px;color:var(--text-muted);">risk ${Number(r.risk_score||0).toFixed(2)}</span>
-                    ${overdueBadge}${escalatedBadge}
-                    <span style="margin-left:auto;font-size:11px;color:var(--text-muted);">${escapeHtml(r.assigned_to || 'unassigned')}</span>
-                </div>
-                <div class="hitl-card-header" onclick="selectHITLRequest('${r.id}')" style="cursor:pointer;">
+            <div class="hitl-card ${activeClass}" onclick="selectHITLRequest('${r.id}')">
+                <div class="hitl-card-header">
                     <span>User: ${escapeHtml(r.user_id)}</span>
                     <time>${date}</time>
                 </div>
-                <p onclick="selectHITLRequest('${r.id}')" style="cursor:pointer;">${escapeHtml((r.prompt||'').slice(0,160))}</p>
+                <p>${escapeHtml(r.prompt)}</p>
             </div>
         `;
     });
+
     listContainer.innerHTML = html;
+
+    // If there is an active item but it's no longer in queue, hide detail view
     if (STATE.activeHitlId && !STATE.hitlRequests[STATE.activeHitlId]) {
         STATE.activeHitlId = null;
         DOM.hitlDetailView.style.display = 'none';
     }
+
+    // Auto-select the first request if none is selected
     if (!STATE.activeHitlId && reqs.length > 0) {
         selectHITLRequest(reqs[0].id);
     }
-    updateBatchBar();
 }
-
-window.toggleHitlSelect = function(id, checked) {
-    if (checked) STATE.selectedHitlIds.add(id); else STATE.selectedHitlIds.delete(id);
-    updateBatchBar();
-    // update checkbox visual without full rerender
-    loadHITLList();
-};
 
 window.selectHITLRequest = function(id) {
     STATE.activeHitlId = id;
+    
+    // Highlight list card
+    const cards = DOM.hitlRequestsList.querySelectorAll('.hitl-card');
+    cards.forEach(c => {
+        c.classList.remove('active');
+    });
+    
+    // Read list item details
     const req = STATE.hitlRequests[id];
     if (!req) return;
+
+    // Rerender details
     DOM.hitlDetailView.style.display = 'flex';
-    const prio = getPriorityMeta(req.priority || 0);
+    
     const formattedTime = new Date(req.timestamp).toLocaleString();
-    const slaInfo = req.sla_deadline ? `SLA: ${new Date(req.sla_deadline).toLocaleString()} ${req.is_overdue ? '<span style="color:#ff1744;font-weight:700;">(OVERDUE)</span>' : ''}` : '';
     DOM.hitlDetailsBody.innerHTML = `
-        <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center;">
-            <span style="background:${prio.bg};color:${prio.color};padding:4px 10px;border-radius:6px;font-size:12px;font-weight:800;">${prio.label} PRIORITY</span>
-            <span style="font-size:13px;">risk <strong>${Number(req.risk_score||0).toFixed(3)}</strong></span>
-            ${req.is_escalated ? '<span style="background:#b388ff;color:#fff;padding:4px 8px;border-radius:6px;font-size:11px;">ESCALATED</span>' : ''}
-        </div>
         <div class="detail-section">
             <h4>Request Context prompt</h4>
             <p>${escapeHtml(req.prompt)}</p>
@@ -856,14 +744,6 @@ window.selectHITLRequest = function(id) {
                 <span>Request ID</span>
                 <strong><code>${escapeHtml(req.id)}</code></strong>
             </div>
-            <div class="meta-box">
-                <span>Assigned To</span>
-                <strong>${escapeHtml(req.assigned_to || 'unassigned')}</strong>
-            </div>
-            <div class="meta-box">
-                <span>SLA Deadline</span>
-                <strong>${slaInfo || '—'}</strong>
-            </div>
         </div>
         ${req.context ? `
             <div class="detail-section" style="margin-top: 10px;">
@@ -876,18 +756,24 @@ window.selectHITLRequest = function(id) {
 
 async function handleHITLDecision(approved) {
     if (!STATE.activeHitlId) return;
+    
     const id = STATE.activeHitlId;
+    
     try {
-        const res = await apiFetch(`/api/v1/hitl/approve/${id}`, {
+        const res = await fetch(`/api/v1/hitl/approve/${id}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ approved: approved, admin_name: 'Admin Panel' })
         });
+        
         const data = await res.json();
+        
         if (data.status === 'success') {
+            // Remove locally and redraw
             delete STATE.hitlRequests[id];
-            STATE.selectedHitlIds.delete(id);
             STATE.activeHitlId = null;
+            
+            // Reload list and badge
             pollPendingHITL();
         } else {
             alert(`Approval failed: ${data.detail || 'Unknown error'}`);
@@ -944,7 +830,7 @@ async function fetchLogs() {
             url += `&action=${STATE.logsAction}`;
         }
         
-        const res = await apiFetch(url);
+        const res = await fetch(url);
         let logs = await res.json();
         STATE.logs = logs;
 
@@ -1101,7 +987,7 @@ function initRedTeaming() {
 
 async function fetchRedteamPayloads() {
     try {
-        const res = await apiFetch('/api/v1/redteaming/payloads');
+        const res = await fetch('/api/v1/redteaming/payloads');
         STATE.redteamPayloads = await res.json();
         
         let html = '';
@@ -1144,7 +1030,7 @@ async function executeRedteamScan() {
     }, 180);
 
     try {
-        const res = await apiFetch('/api/v1/redteaming/scan', { method: 'POST' });
+        const res = await fetch('/api/v1/redteaming/scan', { method: 'POST' });
         const report = await res.json();
         
         clearInterval(progressInterval);
@@ -1243,7 +1129,7 @@ function initPlayground() {
             await sleep(350);
             
             // Make actual API call
-            const res = await apiFetch('/api/v1/process', {
+            const res = await fetch('/api/v1/process', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -1471,7 +1357,7 @@ function initIntegrations() {
 
 async function fetchConfig() {
     try {
-        const res = await apiFetch('/api/v1/config');
+        const res = await fetch('/api/v1/config');
         const config = await res.json();
         
         if (config.primary_provider) {
@@ -1511,7 +1397,7 @@ async function saveConfig() {
             allowed_topics: DOM.allowedTopics.value
         };
         
-        const res = await apiFetch('/api/v1/config', {
+        const res = await fetch('/api/v1/config', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
