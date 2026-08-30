@@ -21,7 +21,7 @@ from src.monitoring.database import Base
 # Import all models so metadata is populated
 from src.monitoring.database import (
     SecurityLog, HITLRequest, PolicyConfig, GatewayConfig,
-    OutboxEvent, IdempotencyRecord,
+    OutboxEvent, IdempotencyRecord, RevokedToken,
 )
 from src.secrets.audit_trail import SecretAccessLog
 from src.redteaming.report_model import RedTeamReport

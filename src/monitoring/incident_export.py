@@ -5,7 +5,6 @@ Exports security logs within a time range, with optional redaction of
 sensitive fields (prompts, responses) for safe sharing.
 """
 
-import json
 import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -48,6 +47,7 @@ def export_incident(
         logs = query.order_by(SecurityLog.timestamp.asc()).limit(max_records).all()
 
         records: List[Dict[str, Any]] = []
+        from ..secrets.field_crypto import decrypt_field, decrypt_json
         for log in logs:
             record: Dict[str, Any] = {
                 "id": log.id,
@@ -60,26 +60,26 @@ def export_incident(
             }
 
             if include_prompts:
-                record["prompt"] = log.prompt
-                record["system_prompt"] = getattr(log, "system_prompt", None)
-                record["retrieved_context"] = getattr(log, "retrieved_context", None)
+                record["prompt"] = decrypt_field(log.prompt)
+                record["system_prompt"] = decrypt_field(getattr(log, "system_prompt", None))
+                record["retrieved_context"] = decrypt_field(getattr(log, "retrieved_context", None))
             else:
                 record["prompt"] = "[REDACTED]"
                 record["system_prompt"] = "[REDACTED]"
                 record["retrieved_context"] = "[REDACTED]"
 
             if include_responses:
-                record["response"] = log.response
+                record["response"] = decrypt_field(log.response)
             else:
                 record["response"] = "[REDACTED]"
 
             # Always include anomalies and trace (they don't contain raw user data)
             try:
-                record["anomalies"] = json.loads(log.anomalies) if log.anomalies else []
+                record["anomalies"] = decrypt_json(log.anomalies, []) if log.anomalies else []
             except Exception:
                 record["anomalies"] = []
             try:
-                record["trace"] = json.loads(log.trace_json) if getattr(log, "trace_json", None) else []
+                record["trace"] = decrypt_json(log.trace_json, []) if getattr(log, "trace_json", None) else []
             except Exception:
                 record["trace"] = []
 

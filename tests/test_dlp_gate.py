@@ -18,6 +18,7 @@ from src.filters.input_filter import InputFilter
 from src.gateway.router import AIRequest, process_ai_request_impl
 from src.monitoring.database import SessionLocal, SecurityLog
 from src.policy.policy_manager import PolicyManager
+from src.secrets.field_crypto import decrypt_field, is_encrypted
 
 
 USER = CurrentUser(subject="dlp_user", tenant_id="default", roles=["user"])
@@ -35,7 +36,10 @@ def _last_log_prompt():
             .order_by(SecurityLog.id.desc())
             .first()
         )
-        return row.prompt if row else None
+        if not row:
+            return None
+        assert is_encrypted(row.prompt)
+        return decrypt_field(row.prompt)
     finally:
         session.close()
 

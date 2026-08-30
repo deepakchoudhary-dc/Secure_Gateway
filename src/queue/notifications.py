@@ -15,6 +15,7 @@ from email.mime.text import MIMEText
 from typing import Dict, Optional
 
 from ..config.settings import settings
+from ..providers.router_provider import validate_outbound_url
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,7 @@ class WebhookNotifier(NotificationProvider):
             return False
         try:
             import httpx
+            validate_outbound_url(self.url, settings.webhook_egress_allowlist)
             payload = {
                 "recipient": recipient,
                 "subject": subject,
@@ -93,7 +95,7 @@ class WebhookNotifier(NotificationProvider):
                 "timestamp": datetime.utcnow().isoformat(),
                 **(metadata or {}),
             }
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
                 resp = await client.post(self.url, json=payload)
                 resp.raise_for_status()
             logger.info("Webhook notification sent to %s: %s", self.url, subject)

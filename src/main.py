@@ -48,36 +48,30 @@ app.add_middleware(
 )
 
 @app.middleware("http")
-async def request_id_middleware(request: Request, call_next):
-    """Inject a unique request ID into every request context and response headers."""
+async def gateway_middleware(request: Request, call_next):
+    """Single-pass middleware: request ID + body-size limit + security headers."""
     incoming_id = request.headers.get("X-Request-ID")
     request_id = set_request_id(incoming_id)
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = request_id
-    return response
 
-@app.middleware("http")
-async def limit_body_size(request: Request, call_next):
-    """Reject oversized request bodies before they are buffered."""
     content_length = request.headers.get("content-length")
     if content_length and content_length.isdigit() and int(content_length) > settings.MAX_BODY_BYTES:
         from fastapi.responses import JSONResponse
-        return JSONResponse(status_code=413, content={"detail": "Request body too large"})
+        return JSONResponse(
+            status_code=413,
+            content={"detail": "Request body too large"},
+            headers={"X-Request-ID": request_id},
+        )
     # ponytail: Content-Length header only; chunked bodies are not measured — cap at the reverse proxy
-    return await call_next(request)
 
-@app.middleware("http")
-async def add_security_headers(request: Request, call_next):
     response = await call_next(request)
-    if not settings.ENABLE_SECURITY_HEADERS:
-        return response
-
-    response.headers.setdefault("X-Content-Type-Options", "nosniff")
-    response.headers.setdefault("X-Frame-Options", "DENY")
-    response.headers.setdefault("Referrer-Policy", "no-referrer")
-    response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
-    if request.url.scheme == "https":
-        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    response.headers["X-Request-ID"] = request_id
+    if settings.ENABLE_SECURITY_HEADERS:
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+        if request.url.scheme == "https":
+            response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     return response
 
 # Include routers

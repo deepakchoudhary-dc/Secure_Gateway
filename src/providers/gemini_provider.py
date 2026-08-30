@@ -67,7 +67,7 @@ class GeminiProvider(LLMProvider):
 
         start = time.monotonic()
         try:
-            resp = self._session.post(url, headers=headers, json=payload, timeout=timeout, allow_redirects=True)
+            resp = self._session.post(url, headers=headers, json=payload, timeout=timeout, allow_redirects=False)
         except requests.exceptions.Timeout as exc:
             raise ProviderError(f"Gemini request timed out after {timeout}s", retryable=True) from exc
         except requests.exceptions.ConnectionError as exc:
@@ -141,7 +141,7 @@ class GeminiProvider(LLMProvider):
 
         start = time.monotonic()
         try:
-            resp = self._session.post(url, headers=headers, json=payload, timeout=timeout, allow_redirects=True)
+            resp = self._session.post(url, headers=headers, json=payload, timeout=timeout, allow_redirects=False)
         except requests.exceptions.Timeout as exc:
             raise ProviderError(f"Gemini request timed out after {timeout}s", retryable=True) from exc
         except requests.exceptions.ConnectionError as exc:
@@ -185,7 +185,7 @@ class GeminiProvider(LLMProvider):
         if max_tokens is not None:
             payload["generationConfig"]["maxOutputTokens"] = max_tokens
         try:
-            with self._session.post(url, headers=headers, json=payload, timeout=timeout, stream=True, allow_redirects=True) as resp:
+            with self._session.post(url, headers=headers, json=payload, timeout=timeout, stream=True, allow_redirects=False) as resp:
                 if resp.status_code != 200:
                     raise ProviderError(f"Gemini API error {resp.status_code}: {resp.text[:500]}", status_code=resp.status_code, retryable=resp.status_code not in _NON_RETRYABLE_STATUS)
                 for line in resp.iter_lines(decode_unicode=True):

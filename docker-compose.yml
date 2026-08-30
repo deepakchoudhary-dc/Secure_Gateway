@@ -1,0 +1,111 @@
+services:
+  gateway:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgresql+psycopg://gateway:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@db:5432/ai_security
+      SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?set JWT_SECRET_KEY}
+      VAULT_ADDR: ${VAULT_ADDR:?set VAULT_ADDR}
+      VAULT_TOKEN: ${VAULT_TOKEN:?set VAULT_TOKEN}
+      PROVIDER_EGRESS_ALLOWLIST: ${PROVIDER_EGRESS_ALLOWLIST:?set PROVIDER_EGRESS_ALLOWLIST}
+      WEBHOOK_EGRESS_ALLOWLIST: ${WEBHOOK_EGRESS_ALLOWLIST:?set WEBHOOK_EGRESS_ALLOWLIST}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?set ALLOWED_ORIGINS}
+      HITL_EMAIL: ${HITL_EMAIL:?set HITL_EMAIL}
+      REDIS_URL: redis://redis:6379/0
+      DATA_RETENTION_DAYS: ${DATA_RETENTION_DAYS:-90}
+      LOG_FORMAT: json
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgresql+psycopg://gateway:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@db:5432/ai_security
+      SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?set JWT_SECRET_KEY}
+      VAULT_ADDR: ${VAULT_ADDR:?set VAULT_ADDR}
+      VAULT_TOKEN: ${VAULT_TOKEN:?set VAULT_TOKEN}
+      PROVIDER_EGRESS_ALLOWLIST: ${PROVIDER_EGRESS_ALLOWLIST:?set PROVIDER_EGRESS_ALLOWLIST}
+      WEBHOOK_EGRESS_ALLOWLIST: ${WEBHOOK_EGRESS_ALLOWLIST:?set WEBHOOK_EGRESS_ALLOWLIST}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?set ALLOWED_ORIGINS}
+      HITL_EMAIL: ${HITL_EMAIL:?set HITL_EMAIL}
+      REDIS_URL: redis://redis:6379/0
+      DATA_RETENTION_DAYS: ${DATA_RETENTION_DAYS:-90}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "60", "1", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ai_security
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d ai_security"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  backup:
+    image: postgres:16-alpine
+    profiles: ["operations"]
+    environment:
+      PGHOST: db
+      PGDATABASE: ai_security
+      PGUSER: gateway
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - ./backups:/backups
+      - ./deploy:/operations:ro
+    entrypoint: ["/bin/sh", "/operations/backup.sh"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  restore:
+    image: postgres:16-alpine
+    profiles: ["operations"]
+    environment:
+      PGHOST: db
+      PGDATABASE: ai_security
+      PGUSER: gateway
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      BACKUP_FILE: ${BACKUP_FILE:-}
+    volumes:
+      - ./backups:/backups:ro
+      - ./deploy:/operations:ro
+    entrypoint: ["/bin/sh", "/operations/restore.sh"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redisdata:

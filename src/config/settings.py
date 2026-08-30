@@ -149,6 +149,7 @@ class Settings(BaseSettings):
     PROVIDER_CIRCUIT_BREAKER_THRESHOLD: int = 5
     PROVIDER_CIRCUIT_BREAKER_COOLDOWN: float = 30.0
     PROVIDER_EGRESS_ALLOWLIST: str = ""
+    WEBHOOK_EGRESS_ALLOWLIST: str = ""
     PROVIDER_REQUEST_TIMEOUT: float = 30.0
 
     # Observability & Alerting
@@ -159,6 +160,10 @@ class Settings(BaseSettings):
     # Database Pooling (for Postgres)
     DB_POOL_SIZE: int = 5
     DB_MAX_OVERFLOW: int = 10
+    REDIS_URL: str = ""
+
+    # Data lifecycle
+    DATA_RETENTION_DAYS: int = 90
 
     # Idempotency Control
     IDEMPOTENCY_TTL_SECONDS: int = 86400  # 24 hours
@@ -169,6 +174,12 @@ class Settings(BaseSettings):
 
     # Token accounting (per-tenant daily LLM token budget; 0 = unlimited)
     TENANT_DAILY_TOKEN_LIMIT: int = 0
+
+    # Response cache for identical LLM calls (0 = disabled)
+    RESPONSE_CACHE_TTL_SECONDS: int = 300
+
+    # Encrypt sensitive log fields at rest (Fernet keyed by SECRET_KEY)
+    ENCRYPT_LOGS_AT_REST: bool = True
 
     class Config:
         env_file = ".env"
@@ -264,6 +275,14 @@ class Settings(BaseSettings):
                 raise ValueError("RS256 JWT authentication requires separate JWT_SECRET_KEY and JWT_PUBLIC_KEY values")
         if not self.PROVIDER_EGRESS_ALLOWLIST.strip():
             raise ValueError("Production requires PROVIDER_EGRESS_ALLOWLIST")
+        if not self.WEBHOOK_EGRESS_ALLOWLIST.strip():
+            raise ValueError("Production requires WEBHOOK_EGRESS_ALLOWLIST")
+        if not self.REDIS_URL.strip().startswith(("redis://", "rediss://")):
+            raise ValueError("Production requires REDIS_URL")
+        if self.DATA_RETENTION_DAYS <= 0:
+            raise ValueError("Production requires a positive DATA_RETENTION_DAYS")
+        if not self.ENCRYPT_LOGS_AT_REST:
+            raise ValueError("Production requires encryption at rest")
         if self.SECRETS_BACKEND != "vault":
             raise ValueError("Production requires SECRETS_BACKEND=vault")
         if not (self.VAULT_ADDR or "").strip().startswith("https://"):
@@ -285,5 +304,9 @@ class Settings(BaseSettings):
         allowed = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
         level = (self.LOG_LEVEL or "INFO").upper()
         return level if level in allowed else "INFO"
+
+    @property
+    def webhook_egress_allowlist(self) -> List[str]:
+        return [host.lower() for host in _parse_csv_or_list(self.WEBHOOK_EGRESS_ALLOWLIST)]
 
 settings = Settings()

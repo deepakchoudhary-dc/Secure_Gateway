@@ -6,6 +6,7 @@ Tokens carry subject, tenant_id, roles, and standard JWT claims.
 """
 
 import logging
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -16,7 +17,40 @@ from ..config.settings import settings
 logger = logging.getLogger(__name__)
 
 _SUPPORTED_ALGORITHMS = {"HS256", "RS256"}
+_MAX_TOKEN_LENGTH = 8192
 
+def revoke_jti(jti: str, expires_at: datetime) -> None:
+    """Persist a token revocation so every application replica enforces it."""
+    from ..monitoring.database import RevokedToken, SessionLocal
+
+    session = SessionLocal()
+    try:
+        if not session.query(RevokedToken.id).filter(RevokedToken.jti == jti).first():
+            session.add(RevokedToken(jti=jti, expires_at=expires_at))
+            session.commit()
+    except Exception as exc:
+        session.rollback()
+        raise TokenError("Token revocation could not be persisted") from exc
+    finally:
+        session.close()
+
+
+def is_jti_revoked(jti: str) -> bool:
+    """Fail closed when revocation state cannot be checked."""
+    from ..monitoring.database import RevokedToken, SessionLocal
+
+    session = SessionLocal()
+    try:
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        return session.query(RevokedToken.id).filter(
+            RevokedToken.jti == jti,
+            RevokedToken.expires_at > now,
+        ).first() is not None
+    except Exception as exc:
+        logger.error("Token revocation lookup failed: %s", exc)
+        return True
+    finally:
+        session.close()
 
 class TokenError(Exception):
     """Raised when a token cannot be created or verified."""
@@ -63,6 +97,7 @@ def create_access_token(
         "iat": now,
         "exp": exp,
         "iss": getattr(settings, "JWT_ISSUER", "ai-security-gateway"),
+        "jti": uuid.uuid4().hex,
     }
     audience = getattr(settings, "JWT_AUDIENCE", "")
     if audience:
@@ -80,6 +115,8 @@ def create_access_token(
 
 def decode_access_token(token: str) -> Dict[str, Any]:
     """Verify and decode a JWT.  Returns the full claims dict on success."""
+    if not isinstance(token, str) or len(token) > _MAX_TOKEN_LENGTH:
+        raise TokenError("Invalid token")
     algorithm = _resolve_algorithm()
     key = _resolve_verification_key()
 
@@ -98,6 +135,9 @@ def decode_access_token(token: str) -> Dict[str, Any]:
 
     try:
         claims: Dict[str, Any] = pyjwt.decode(token, key, **decode_options)
+        jti = claims.get("jti")
+        if jti and is_jti_revoked(jti):
+            raise TokenError("Token has been revoked")
         return claims
     except pyjwt.ExpiredSignatureError as exc:
         raise TokenError("Token has expired") from exc

@@ -125,10 +125,13 @@ class PolicyManager:
         try:
             db_policies = session.query(PolicyConfig).all()
             if db_policies:
+                from ..secrets.field_crypto import decrypt_json
                 policies = {}
                 for p in db_policies:
                     try:
-                        rules = json.loads(p.rules_json)
+                        rules = decrypt_json(p.rules_json, {})
+                        if not isinstance(rules, dict):
+                            rules = {}
                     except Exception:
                         rules = {}
                     policies[p.name] = Policy(
@@ -161,6 +164,7 @@ class PolicyManager:
 
     def _save_policies(self):
         """Save policies state from self.policies back to the database"""
+        from ..secrets.field_crypto import encrypt_json
         session = SessionLocal()
         try:
             for name, policy in self.policies.items():
@@ -169,7 +173,7 @@ class PolicyManager:
                     db_p = PolicyConfig(name=name)
                     session.add(db_p)
                 db_p.description = policy.description
-                db_p.rules_json = json.dumps(policy.rules)
+                db_p.rules_json = encrypt_json(policy.rules)
                 db_p.enabled = policy.enabled
             session.commit()
             self._clear_cache()
@@ -223,7 +227,8 @@ class PolicyManager:
                     if "description" in policy_data:
                         db_p.description = policy_data["description"]
                     if "rules" in policy_data:
-                        db_p.rules_json = json.dumps(policy_data["rules"])
+                        from ..secrets.field_crypto import encrypt_json
+                        db_p.rules_json = encrypt_json(policy_data["rules"])
                     if "enabled" in policy_data:
                         db_p.enabled = policy_data["enabled"]
                     updated.append(name)

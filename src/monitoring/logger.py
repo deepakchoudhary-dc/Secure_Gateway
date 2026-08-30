@@ -99,20 +99,21 @@ def log_transaction(
     }
     logger.info(f"Gateway Transaction: {json.dumps(log_entry)}")
 
-    # SQLite write
+    # Sensitive fields are encrypted before persistence when enabled.
+    from ..secrets.field_crypto import encrypt_field, encrypt_json
     session = SessionLocal()
     try:
         db_log = SecurityLog(
             user_id=user_id,
-            prompt=prompt,
-            system_prompt=system_prompt,
-            retrieved_context=retrieved_context,
-            response=response,
+            prompt=encrypt_field(prompt),
+            system_prompt=encrypt_field(system_prompt),
+            retrieved_context=encrypt_field(retrieved_context),
+            response=encrypt_field(response),
             risk_score=risk_score,
             flagged=flagged,
             duration=duration,
-            anomalies=json.dumps(anomalies),
-            trace_json=json.dumps(trace or []),
+            anomalies=encrypt_json(anomalies),
+            trace_json=encrypt_json(trace or []),
             action_taken=action_taken,
             client_ip=client_ip,
             request_id=get_request_id() or None,

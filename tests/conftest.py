@@ -15,6 +15,7 @@ os.environ["REQUIRE_ADMIN_AUTH"] = "false"
 os.environ["ADMIN_API_KEY"] = "admin-test-key-12345678901234567890"
 os.environ["API_KEY"] = "user-test-key-12345678901234567890"
 os.environ["AUTH_MODE"] = "api_key"
+os.environ["WEBHOOK_EGRESS_ALLOWLIST"] = "example.com"
 os.environ["LOG_FORMAT"] = "text"
 
 from src.monitoring.database import init_db, engine, Base

@@ -11,7 +11,6 @@ import secrets
 from urllib.parse import urlparse
 from fastapi import APIRouter, HTTPException, Depends, Header, status, Response
 from fastapi.responses import StreamingResponse
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, validator
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
@@ -35,6 +34,7 @@ from ..auth.jwt_auth import create_access_token, TokenError
 from ..providers.base import LLMMessage, ProviderError
 from ..providers.router_provider import ProviderRouter, assert_https_public_host
 from ..secrets.secrets_manager import get_secrets_manager
+from . import response_cache
 from .idempotency import (
     IdempotencyService,
     IdempotencyError,
@@ -886,6 +886,14 @@ async def process_ai_request_impl(
             else:
                 response_text = f"Code failed execution.\n[ERROR]\n{sandbox_result['error']}"
         else:
+            # Response cache: identical clean prompts skip the LLM entirely
+            rkey = response_cache.cache_key(tenant_id or "default", request.user_id or "anonymous", sanitized_prompt, request.system_prompt, request.retrieved_context, gw_config.primary_model if gw_config else None)
+            cached = response_cache.get(rkey)
+            if cached is not None:
+                metrics.inc("response_cache_hits")
+                response_text = cached
+                add_trace("response_cache", "hit", {"key": rkey[:12]})
+                return finalize_response()
             provider_type = gw_config.primary_provider if gw_config else "mock"
             add_trace("model_routing", "selected", {
                 "provider": provider_type,
@@ -995,6 +1003,12 @@ async def process_ai_request_impl(
                     "reason": "no sensitive output patterns detected"
                 })
             response_text = filtered_response
+            # Cache only clean allowed responses
+            if action_taken == "allowed" and not flagged:
+                try:
+                    response_cache.put(rkey, response_text)
+                except Exception:
+                    pass
 
         # Step 7: Final Transaction Log & Return
         add_trace("request_complete", "done", {
@@ -1030,6 +1044,25 @@ async def issue_token(req: TokenRequest):
         return {"access_token": token, "token_type": "bearer"}
     except TokenError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/auth/revoke", dependencies=[_get_admin_dependency()])
+async def revoke_token(authorization: Optional[str] = Header(default=None)):
+    """Revoke the presented bearer token (logout)."""
+    from ..auth.tenant import _extract_bearer_token
+    from ..auth.jwt_auth import decode_access_token, revoke_jti, TokenError
+
+    token = _extract_bearer_token(authorization)
+    if not token:
+        raise HTTPException(status_code=400, detail="Bearer token required")
+    try:
+        claims = decode_access_token(token)  # must be valid to revoke
+    except TokenError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    jti = claims.get("jti")
+    if jti:
+        revoke_jti(jti)
+    return {"status": "success", "revoked": True}
 
 
 # ── Gateway Config Endpoints ──────────────────────────────────────────

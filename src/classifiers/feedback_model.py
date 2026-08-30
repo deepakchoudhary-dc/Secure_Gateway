@@ -14,6 +14,7 @@ from typing import List, Optional, Tuple
 from sqlalchemy import Column, DateTime, Integer, String, Text, func
 
 from ..monitoring.database import Base, SessionLocal
+from ..secrets.field_crypto import decrypt_field, encrypt_field
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,7 @@ def record_feedback(source: str, label: str, prompt: str, tenant_id: Optional[st
         session.add(DetectionFeedback(
             source=source,
             label=label,
-            prompt=prompt[:10000],
+            prompt=encrypt_field(prompt[:10000]),
             tenant_id=tenant_id,
             created_at=datetime.utcnow(),
         ))
@@ -73,7 +74,7 @@ def get_learned_malicious_prompts(tenant_id: Optional[str], limit: int = LEARNED
             .limit(limit)
             .all()
         )
-        return [r[0] for r in rows]
+        return [decrypt_field(row[0]) for row in rows]
     except Exception as exc:
         logger.error("Failed to load learned prompts: %s", exc)
         return []

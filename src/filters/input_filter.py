@@ -109,6 +109,8 @@ class InputFilter:
         self.sensitive_enabled = bool(sd.get("enabled", True))
         self.max_pii_matches = int(sd.get("max_pii_matches", 8))
         self.block_kinds = set(sd.get("block_kinds", self.DEFAULT_BLOCK_KINDS))
+        self.corp_min_score = int(sd.get("corp_min_score", 4))
+        self.corp_keywords = list(sd.get("corp_keywords", self.DEFAULT_CORP_KEYWORDS))
 
     def sanitize(self, input_text: str) -> str:
         """
@@ -205,6 +207,45 @@ class InputFilter:
             return {
                 "reason": f"Blocked: request appears to contain bulk personal data ({total_soft} matches).",
                 "kinds": sorted(findings),
+            }
+        return None
+
+    # ── Corporate/financial prose gate (weak-spot fix: prose secrets) ──
+    MONEY_PATTERN = re.compile(
+        r"(?:[$€£₹]\s?\d[\d,]*(?:\.\d+)?(?:\s?(?:million|billion|m|b|k|cr|lakh))?)"
+        r"|\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b",
+        re.IGNORECASE,
+    )
+    DEFAULT_CORP_KEYWORDS = [
+        "revenue", "payroll", "salary", "salaries", "margin", "profit", "earnings",
+        "forecast", "budget", "acquisition", "merger", "layoff", "bonus",
+        "customer list", "trade secret", "internal only", "confidential", "nda",
+        "unreleased", "roadmap", "valuation", "term sheet", "cap table",
+    ]
+
+    def scan_corporate_signals(self, *texts: str) -> Dict[str, Any]:
+        """Detect finance/corporate document fingerprints in free prose."""
+        lower_joined = "\n".join(t.lower() for t in texts if t)
+        kw_hits = sorted({k for k in self.corp_keywords if k in lower_joined})
+        money_count = sum(len(self.MONEY_PATTERN.findall(t)) for t in texts if t)
+        return {"keywords": kw_hits, "money_count": money_count}
+
+    def evaluate_corporate_content(self, signals: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Block prose that looks like internal financial/corporate documents.
+
+        ponytail: keyword+amount heuristic — catches the common 'paste the
+        earnings sheet' case; NER/classifier models are the upgrade path.
+        """
+        if not self.sensitive_enabled:
+            return None
+        kw_count = len(signals.get("keywords", []))
+        money = int(signals.get("money_count", 0))
+        score = kw_count * 2 + min(money, 3)
+        if score >= self.corp_min_score:
+            kws = ", ".join(signals["keywords"][:3])
+            return {
+                "reason": f"Blocked: request appears to contain confidential corporate/financial content (signals: {kws or 'amounts'}).",
+                "kinds": ["Corporate/Financial"],
             }
         return None
 

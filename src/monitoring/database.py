@@ -4,8 +4,7 @@ Database module for AI Security Gateway -- Handles persistence of logs, policies
 
 import os
 import logging
-import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, Text, DateTime, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, scoped_session
@@ -127,17 +126,17 @@ class GatewayConfig(Base):
     id = Column(Integer, primary_key=True, index=True)
     
     # Primary configuration
-    primary_provider = Column(String(50), default="gemini")  # mock, openai, anthropic, gemini, custom
-    primary_url = Column(String(255), default="")
+    primary_provider = Column(String(50), default="openai")
+    primary_url = Column(String(255), default="https://api.openai.com/v1/chat/completions")
     primary_key = Column(String(255), default="")
-    primary_model = Column(String(100), default="gemini-2.0-flash")
+    primary_model = Column(String(100), default="gpt-4o-mini")
     
     # Fallback configuration
     fallback_enabled = Column(Boolean, default=False)
-    fallback_provider = Column(String(50), default="mock")
+    fallback_provider = Column(String(50), default="openai")
     fallback_url = Column(String(255), default="")
     fallback_key = Column(String(255), default="")
-    fallback_model = Column(String(100), default="gpt-3.5-turbo")
+    fallback_model = Column(String(100), default="gpt-4o-mini")
     
     # Topic limits rail config
     allowed_topics = Column(Text, default="")  # Comma-separated list of allowed topics (e.g., support, account)
@@ -177,6 +176,15 @@ class IdempotencyRecord(Base):
     completed_at = Column(DateTime, nullable=True)
     expires_at = Column(DateTime, nullable=False, index=True)
 
+
+class RevokedToken(Base):
+    __tablename__ = "revoked_tokens"
+
+    id = Column(Integer, primary_key=True)
+    jti = Column(String(64), nullable=False, unique=True, index=True)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    revoked_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
 def check_migrations_current() -> bool:
     """Check if the database schema is up to date with Alembic migrations."""
     try:
@@ -210,39 +218,40 @@ def check_migrations_current() -> bool:
 
 
 def init_db():
-    """Initialize database tables and seed defaults without dropping persisted data."""
+    """Initialize development data; production schemas must come from Alembic."""
     from ..secrets.audit_trail import SecretAccessLog  # noqa: F401
     from ..redteaming.report_model import RedTeamReport  # noqa: F401
     from ..classifiers.feedback_model import DetectionFeedback  # noqa: F401
     # Imported here (not at module level) to avoid a circular import:
     from ..policy.policy_manager import DEFAULT_POLICY_RULES
+    from ..secrets.field_crypto import decrypt_json, encrypt_json
 
-    Base.metadata.create_all(bind=engine)
-    check_migrations_current()
+    if settings._is_production:
+        if not check_migrations_current():
+            raise RuntimeError("Database migrations are not current")
+    else:
+        Base.metadata.create_all(bind=engine)
 
     session = SessionLocal()
     try:
         # Seed configs table if empty
         if session.query(GatewayConfig).count() == 0:
             default_config = GatewayConfig(
-                primary_provider="gemini",
-                primary_url="",
-                primary_key="env://MOCK_API_KEY",
-                primary_model="gemini-2.0-flash",
+                primary_provider="openai",
+                primary_url="https://api.openai.com/v1/chat/completions",
+                primary_key="",
+                primary_model="gpt-4o-mini",
                 fallback_enabled=False,
-                fallback_provider="mock",
+                fallback_provider="openai",
                 fallback_url="",
                 fallback_key="",
-                fallback_model="gpt-3.5-turbo",
+                fallback_model="gpt-4o-mini",
                 allowed_topics=""
             )
             session.add(default_config)
             session.commit()
         else:
             configs = session.query(GatewayConfig).all()
-            for config in configs:
-                if not config.primary_key or config.primary_key == "":
-                    config.primary_key = "env://MOCK_API_KEY"
             session.commit()
 
         # Seed policy table if empty (single source of truth: policy_manager.DEFAULT_POLICY_RULES)
@@ -251,22 +260,23 @@ def init_db():
                 session.add(PolicyConfig(
                     name=name,
                     description=spec["description"],
-                    rules_json=json.dumps(spec["rules"]),
+                    rules_json=encrypt_json(spec["rules"]),
                     enabled=True,
                 ))
             session.commit()
         else:
             input_val_policy = session.query(PolicyConfig).filter(PolicyConfig.name == "input_validation").first()
-            if input_val_policy and "jailbreak_templates" not in input_val_policy.rules_json:
+            stored_rules = decrypt_json(input_val_policy.rules_json, {}) if input_val_policy else {}
+            if input_val_policy and "jailbreak_templates" not in stored_rules:
                 try:
-                    rules = json.loads(input_val_policy.rules_json)
+                    rules = stored_rules
                     configured_patterns = rules.setdefault("block_patterns", [])
                     for pattern in REQUIRED_INPUT_BLOCK_PATTERNS:
                         if pattern not in configured_patterns:
                             configured_patterns.append(pattern)
                     rules.setdefault("semantic_threshold", DEFAULT_POLICY_RULES["input_validation"]["rules"]["semantic_threshold"])
                     rules.setdefault("jailbreak_templates", list(DEFAULT_POLICY_RULES["input_validation"]["rules"]["jailbreak_templates"]))
-                    input_val_policy.rules_json = json.dumps(rules)
+                    input_val_policy.rules_json = encrypt_json(rules)
                     session.commit()
                 except Exception as ex:
                     session.rollback()
@@ -274,7 +284,7 @@ def init_db():
             elif input_val_policy:
                 try:
                     import copy
-                    rules = json.loads(input_val_policy.rules_json)
+                    rules = stored_rules
                     configured_patterns = rules.setdefault("block_patterns", [])
                     changed = False
                     # Backfill rule keys introduced after this DB was seeded
@@ -304,7 +314,7 @@ def init_db():
                         rules["pii_patterns"] = filtered_pii
                         changed = True
                     if changed:
-                        input_val_policy.rules_json = json.dumps(rules)
+                        input_val_policy.rules_json = encrypt_json(rules)
                         session.commit()
                 except Exception as ex:
                     session.rollback()
@@ -314,6 +324,61 @@ def init_db():
         logger.error(f"Failed to load default database seed: {e}")
     finally:
         session.close()
+
+def purge_expired_data() -> int:
+    """Apply the configured retention period and remove expired operational data."""
+    from ..classifiers.feedback_model import DetectionFeedback
+
+    cutoff = datetime.utcnow() - timedelta(days=settings.DATA_RETENTION_DAYS)
+    session = SessionLocal()
+    try:
+        deleted = 0
+        deleted += session.query(SecurityLog).filter(SecurityLog.timestamp < cutoff).delete(synchronize_session=False)
+        deleted += session.query(HITLRequest).filter(
+            HITLRequest.created_at < cutoff,
+            HITLRequest.status != "pending",
+        ).delete(synchronize_session=False)
+        deleted += session.query(DetectionFeedback).filter(
+            DetectionFeedback.created_at < cutoff
+        ).delete(synchronize_session=False)
+        deleted += session.query(OutboxEvent).filter(
+            OutboxEvent.created_at < cutoff,
+            OutboxEvent.status.in_(["completed", "dead_letter"]),
+        ).delete(synchronize_session=False)
+        deleted += session.query(IdempotencyRecord).filter(
+            IdempotencyRecord.expires_at <= datetime.utcnow()
+        ).delete(synchronize_session=False)
+        deleted += session.query(RevokedToken).filter(
+            RevokedToken.expires_at <= datetime.utcnow()
+        ).delete(synchronize_session=False)
+        session.commit()
+        return deleted
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def erase_tenant_data(tenant_id: str) -> int:
+    """Erase tenant-scoped logs, reviews, and learning feedback."""
+    from ..classifiers.feedback_model import DetectionFeedback
+
+    session = SessionLocal()
+    try:
+        deleted = 0
+        for model in (SecurityLog, HITLRequest, DetectionFeedback, IdempotencyRecord):
+            deleted += session.query(model).filter(model.tenant_id == tenant_id).delete(
+                synchronize_session=False
+            )
+        session.commit()
+        return deleted
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
 
 def get_db():
     """Get DB session dependency"""

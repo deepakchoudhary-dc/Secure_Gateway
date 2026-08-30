@@ -21,6 +21,8 @@ VALID = {
     "REDTEAM_ENDPOINTS_ENABLED": False,
     "DATABASE_URL": "postgresql://user:pass@db.internal:5432/ai_security",
     "PROVIDER_EGRESS_ALLOWLIST": "api.openai.com,api.anthropic.com",
+    "WEBHOOK_EGRESS_ALLOWLIST": "client.example.com",
+    "REDIS_URL": "redis://redis:6379/0",
     "SECRETS_BACKEND": "vault",
     "VAULT_ADDR": "https://vault.example.com",
     "ALLOWED_ORIGINS": "https://app.example.com",
@@ -70,6 +72,11 @@ def test_wildcard_origin_with_credentials_rejected(prod_env):
 def test_missing_egress_allowlist_rejected(prod_env):
     with pytest.raises(ValueError, match="EGRESS_ALLOWLIST"):
         make_settings(PROVIDER_EGRESS_ALLOWLIST="")
+
+
+def test_missing_webhook_egress_allowlist_rejected(prod_env):
+    with pytest.raises(ValueError, match="WEBHOOK_EGRESS_ALLOWLIST"):
+        make_settings(WEBHOOK_EGRESS_ALLOWLIST="")
 
 
 def test_http_outbound_model_url_rejected(prod_env):
