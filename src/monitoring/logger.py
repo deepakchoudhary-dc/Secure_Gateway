@@ -7,7 +7,7 @@ import logging
 import logging.handlers
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 import json
 from ..config.settings import settings
@@ -84,7 +84,7 @@ def log_transaction(
     """
     # Console output
     log_entry = {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "request_id": get_request_id(),
         "user_id": user_id,
         "tenant_id": tenant_id,
@@ -121,7 +121,7 @@ def log_transaction(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
-            timestamp=datetime.utcnow()
+            timestamp=datetime.now(timezone.utc)
         )
         session.add(db_log)
         session.commit()
@@ -186,7 +186,7 @@ class StructuredJsonFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         entry = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),

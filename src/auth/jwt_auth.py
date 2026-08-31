@@ -19,9 +19,15 @@ logger = logging.getLogger(__name__)
 _SUPPORTED_ALGORITHMS = {"HS256", "RS256"}
 _MAX_TOKEN_LENGTH = 8192
 
-def revoke_jti(jti: str, expires_at: datetime) -> None:
+def revoke_jti(jti: str, expires_at: Optional[datetime] = None) -> None:
     """Persist a token revocation so every application replica enforces it."""
     from ..monitoring.database import RevokedToken, SessionLocal
+
+    if expires_at is None:
+        # Use token exp if available, otherwise 24h default
+        expires_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=24)
+    elif expires_at.tzinfo is not None:
+        expires_at = expires_at.replace(tzinfo=None)
 
     session = SessionLocal()
     try:

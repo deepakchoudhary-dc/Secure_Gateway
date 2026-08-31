@@ -11,10 +11,7 @@ try:
     load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".env"))
 except Exception:
     pass
-try:
-    from pydantic.v1 import BaseSettings  # pydantic v2 namespace
-except ImportError:
-    from pydantic import BaseSettings  # pydantic v1
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _DEFAULT_DEV_SECRET = ""
 _PLACEHOLDER_SECRETS = {"", "your-secret-key-here", "dev-only-change-me"}
@@ -178,12 +175,14 @@ class Settings(BaseSettings):
     # Response cache for identical LLM calls (0 = disabled)
     RESPONSE_CACHE_TTL_SECONDS: int = 300
 
-    # Encrypt sensitive log fields at rest (Fernet keyed by SECRET_KEY)
+    # Encrypt sensitive log fields at rest
+    # - DATA_ENCRYPTION_KEY (v2, preferred): dedicated field-encryption key,
+    #   independent of SECRET_KEY so signing secrets can rotate independently
+    # - SECRET_KEY (v1, legacy fallback): used when DATA_ENCRYPTION_KEY is unset
     ENCRYPT_LOGS_AT_REST: bool = True
+    DATA_ENCRYPTION_KEY: str = ""
 
-    class Config:
-        env_file = ".env"
-        extra = "ignore"
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     def __init__(self, **values):
         super().__init__(**values)
@@ -283,6 +282,8 @@ class Settings(BaseSettings):
             raise ValueError("Production requires a positive DATA_RETENTION_DAYS")
         if not self.ENCRYPT_LOGS_AT_REST:
             raise ValueError("Production requires encryption at rest")
+        if self.DATA_ENCRYPTION_KEY and len(self.DATA_ENCRYPTION_KEY.strip()) < 32:
+            raise ValueError("DATA_ENCRYPTION_KEY must be at least 32 characters when set")
         if self.SECRETS_BACKEND != "vault":
             raise ValueError("Production requires SECRETS_BACKEND=vault")
         if not (self.VAULT_ADDR or "").strip().startswith("https://"):

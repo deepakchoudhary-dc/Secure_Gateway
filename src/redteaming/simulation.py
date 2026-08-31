@@ -9,7 +9,7 @@ import json
 import os
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any
 from ..gateway.router import process_ai_request_impl, AIRequest
 
@@ -138,7 +138,7 @@ class RedTeamingSuite:
         }
 
         report = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "payload_version": self.version,
             "scan_duration_seconds": round(duration, 3),
             "metrics": metrics,
@@ -165,7 +165,7 @@ class RedTeamingSuite:
             session = SessionLocal()
             try:
                 db_report = RedTeamReport(
-                    timestamp=datetime.utcnow(),
+                    timestamp=datetime.now(timezone.utc),
                     payload_version=self.version,
                     scan_duration_seconds=round(duration, 3),
                     total_payloads=metrics["total_payloads"],

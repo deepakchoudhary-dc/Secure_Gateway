@@ -1,8 +1,8 @@
 """Database-backed notification/webhook outbox with retry and crash recovery."""
 import asyncio
 import logging
-from datetime import datetime, timedelta
-from typing import Any, Dict
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional
 from ..config.settings import settings
 from ..monitoring.database import OutboxEvent, SessionLocal
 from ..providers.router_provider import validate_outbound_url
@@ -24,7 +24,7 @@ def enqueue_notification(session, *, recipient: str, subject: str, body: str, me
     ))
 
 
-def enqueue_webhook(session, url: str, payload: Dict[str, Any]) -> None:
+def enqueue_webhook(session, url: str, payload: Dict[str, Any], tenant_id: Optional[str] = None) -> None:
     """Enqueue a durable webhook POST. Pass session=None to manage its own."""
     _validate_webhook_url(url)
     own = session is None
@@ -36,6 +36,7 @@ def enqueue_webhook(session, url: str, payload: Dict[str, Any]) -> None:
             payload_json=encrypt_json({"url": url, "json": payload}),
             status="pending",
             available_at=datetime.utcnow(),
+            tenant_id=tenant_id,
         )
         session.add(event)
         if own:
@@ -69,11 +70,23 @@ async def _deliver_webhook(payload: Dict[str, Any], event_id: int) -> bool:
         return False
 
 
+async def _handle_hitl_resume(payload: Dict[str, Any]) -> bool:
+    """Process a durable HITL resume event by re-running the approved request."""
+    from ..hitl.hitl_manager import HITLManager  # local import: avoids circular dependency
+
+    return await HITLManager()._resume_and_notify(payload)
+
+
 async def run_notification_outbox(stop_event: asyncio.Event) -> None:
     # ponytail: piggyback idempotency expiry sweep on the 1s tick (every ~60s)
     tick = 0
     while not stop_event.is_set():
-        await deliver_next_notification()
+        try:
+            await deliver_next_notification()
+        except Exception:
+            # One bad event must not kill the worker loop; the event stays
+            # leased until its lease expires and is retried after backoff.
+            logger.exception("Outbox delivery cycle failed")
         tick += 1
         if tick % 60 == 0:
             _sweep_expired_idempotency()
@@ -98,7 +111,7 @@ def _purge_expired_data() -> None:
 
 def _sweep_expired_idempotency() -> None:
     """Delete completed idempotency records past their TTL (audit A8)."""
-    from datetime import datetime as _dt
+    from datetime import datetime as _dt, timezone
     from ..monitoring.database import IdempotencyRecord
     session = SessionLocal()
     try:
@@ -144,7 +157,15 @@ async def deliver_next_notification() -> bool:
         session.close()
 
     # ponytail: sync smtplib inside async send blocks the loop briefly — move into to_thread when email volume matters
-    success = await get_notification_dispatcher().send(**payload) if topic == "notification" else await _deliver_webhook(payload, event_id)
+    if topic == "notification":
+        success = await get_notification_dispatcher().send(**payload)
+    elif topic == "hitl_resume":
+        success = await _handle_hitl_resume(payload)
+    elif topic == "webhook":
+        success = await _deliver_webhook(payload, event_id)
+    else:
+        logger.error("Outbox event %s has unknown topic %r — cannot deliver", event_id, topic)
+        success = False
 
     session = SessionLocal()
     try:

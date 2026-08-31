@@ -5,7 +5,7 @@ Every get / rotate / store operation can be recorded for compliance.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import Column, DateTime, Integer, String, Text
@@ -43,7 +43,7 @@ def log_secret_access(
             actor=actor or "system",
             tenant_id=tenant_id,
             detail=detail,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
         )
         session.add(entry)
         session.commit()

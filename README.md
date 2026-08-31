@@ -1,146 +1,171 @@
-# AI Security Gateway
+# AI Security Gateway — Secure.AI Hub
 
-A scalable, enterprise-grade AI Security Gateway that acts as a centralized defense layer for monitoring, filtering, and securing all AI-driven interactions across web tools, browser extensions, and AI agents.
+A FastAPI-based **AI Security Gateway** that proxies LLM calls through layered inspection: input sanitization, semantic jailbreak detection, RAG injection checks, credential/PII redaction, system-prompt leakage guard, sandboxed code execution, and human-in-the-loop (HITL) review. All decisions are traced, logged, and auditable.
 
-## Features
+> **Status:** Functional prototype with production hardening in progress. See *Limitations* below. Local SQLite is fine for `clone → run`; production requires Postgres + Redis + Vault (see *Production*).
 
-### Core Capabilities
+---
 
-- **Input Sanitization & Validation**: Multi-layer filters using regex, semantic analysis, and AI-powered classifiers
-- **Prompt Engineering & Structural Guardrails**: Structured prompt templates with clear delimiters
-- **Access Control & Sandbox Environment**: Role-based access control and isolated execution environments
-- **Runtime Monitoring & Anomaly Detection**: Real-time monitoring with anomaly detection algorithms
-- **Output Filtering & Verification**: Safe pattern verification and manipulation detection
-- **Adversarial Testing & Red Teaming**: Proactive attack simulation and vulnerability testing
-- **Human-in-the-Loop (HITL)**: Manual approval for high-risk actions
-- **Policy & Governance Hub**: Centralized policy management interface
+## What it actually does
+
+- **Input pipeline:** length checks → topic-lock rails → anomaly scan → regex blocklist (40+ patterns, leetspeak + base64 decode) → TF-IDF semantic jailbreak similarity (with learned feedback) → RAG indirect-injection scan → **DLP gate** (credential formats block outright, bulk PII + corporate/financial prose blocked by threshold).
+- **Classification:** HuggingFace `martin-ha/toxic-comment-model` when available, heuristic fallback otherwise. Scores feed policy decisions.
+- **Policy & HITL:** DB-driven policies (regex, thresholds, rate limits, RBAC). Flagged requests go to a **priority queue** (critical/high/medium/low by risk score), support **batch approve/deny**, **SLA escalation**, and **SSE live updates** (`GET /hitl/events`). Decisions are optionally **webhooked** and auto-resumed via a durable outbox.
+- **LLM routing:** Primary → fallback with circuit breakers, retry with backoff budgets, and **egress allowlist + public-IP DNS checks** (no redirects). Provider sessions are pooled. Responses are **hash-cached** (tenant-scoped) and **streamable** via `POST /process/stream` with a hold-back PII buffer and kill-switch.
+- **Output:** system-prompt leakage guard (phrase + overlap), PII/token redaction (credit cards, emails, phones, API keys, JWTs, DB URLs, etc.).
+- **Audit:** Structured JSON logs, Prometheus metrics, incident export (time-bounded, tenant-scoped, redacted), and token accounting per tenant.
+
+---
 
 ## Architecture
 
 ```
-AI Security Gateway
-├── Gateway Service Layer (FastAPI)
-├── Filter & Classifier Modules
-│   ├── Static Filters (Regex, Keywords)
-│   └── Dynamic AI Classifiers (Semantic Analysis)
-├── Execution Sandboxes
-├── Monitoring & Alerting System
-├── Human Approval Workflow
-├── Policy Management Dashboard
-└── Red-Teaming & Simulation Suite
+[ Client ] → [ Topic-lock & Input Filters ] → [ AI Classifier ] → [ Policy / HITL ] → [ Sandbox ] → [ LLM Provider (primary → fallback) ] → [ Leakage Guard & PII Redactor ] → Response
+                                                            ↓
+                                              [ Outbox (notifications/webhooks) + Feedback learning loop ]
 ```
 
-## Installation
+---
 
-1. Clone the repository
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Run the application:
-   ```bash
-   python run.py
-   ```
+## Quick start (local, no deps beyond pip)
 
-## Usage
-
-### API Endpoints
-
-- `POST /api/v1/process` - Process AI requests through security gateway
-- `GET /api/v1/policies` - Get current security policies
-- `POST /api/v1/policies` - Update security policies
-
-### Example Request
-
-```python
-import requests
-
-response = requests.post("http://localhost:8000/api/v1/process", json={
-    "prompt": "Your AI prompt here",
-    "user_id": "user123",
-    "context": "Optional context",
-    "model": "gpt-3.5-turbo"
-})
-
-print(response.json())
+```bash
+git clone https://github.com/deepakchoudhary-dc/Something-is-coming-up-next.git
+cd Something-is-coming-up-next
+python -m venv .venv
+# Windows: .venv\Scripts\activate  |  Unix: source .venv/bin/activate
+pip install -r requirements.txt
+python run.py  # http://localhost:8000  (dashboard at /)
+# tests:
+pytest -q
 ```
 
-## Configuration
+Local defaults: `DATABASE_URL=sqlite:///./ai_security.db`, `REQUIRE_AUTH=false` in test, no Redis/Vault required. Hit the playground at `/` to exercise the pipeline.
 
-Edit `src/config/settings.py` to configure:
-- Server settings (host, port)
-- Security thresholds
-- Database connection
-- Monitoring settings
-- Email notifications
+Optional: the HuggingFace toxicity classifier needs `pip install -r requirements-ai.txt` (heavy, ~2 GB for torch); without it the gateway uses the heuristic classifier automatically. For production-parity testing without Docker, point `DATABASE_URL` at a local Postgres and `REDIS_URL` at a local Redis and run `alembic upgrade head` first.
 
-## Security Features
+---
 
-### Input Validation
-- Length limits and pattern checks
-- Malicious keyword detection
-- Semantic analysis for nuanced threats
+## Production deployment
 
-### Access Control
-- Role-based access control (RBAC)
-- Principle of least privilege
-- User session management
+**Do not use `run.py` or SQLite in production.** Use the production compose (Postgres + Redis) and set required env vars:
 
-### Monitoring
-- Real-time request logging
-- Anomaly detection
-- Elasticsearch integration for log analysis
+```bash
+# 1. Create .env for production
+APP_ENV=production
+SECRET_KEY=<64+ random chars, ≥32>
+API_KEY=<32+ random chars>
+ADMIN_API_KEY=<32+ random chars, different>
+AUTH_MODE=jwt
+JWT_SECRET_KEY=<64+ random chars, HS256 ≥32 or RS256 keypair>
+DATABASE_URL=postgresql://gateway:${POSTGRES_PASSWORD}@db:5432/ai_security
+REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+REDIS_PASSWORD=<32+ random chars, Redis auth — required by compose>
+DATA_ENCRYPTION_KEY=<32+ random chars, dedicated field-encryption key (v2)>
+VAULT_ADDR=https://vault.yourcompany.com
+VAULT_TOKEN=<vault-token>
+SECRETS_BACKEND=vault
+PROVIDER_EGRESS_ALLOWLIST=api.openai.com,api.anthropic.com
+WEBHOOK_EGRESS_ALLOWLIST=hooks.yourcompany.com
+ALLOWED_ORIGINS=https://yourdomain.com
+DATA_RETENTION_DAYS=90
+ENCRYPT_LOGS_AT_REST=true
+HITL_EMAIL=security-team@yourcompany.com
+# optional: REDIS_URL, WEBHOOK_URL, SMTP_*
 
-### Human Oversight
-- High-risk request flagging
-- Manual approval workflow
-- Audit trail generation
+# 2. Build & run
+docker compose up --build
+# or: gunicorn -w 4 -k uvicorn.workers.UvicornWorker src.main:app
 
-## Development
+# 3. Migrations (first start only, or on upgrade)
+alembic upgrade head
+```
 
-### Project Structure
+**Required prod env vars (enforced at boot, app will crash if missing):**
+`SECRET_KEY` (≥32, not placeholder), `API_KEY`/`ADMIN_API_KEY` (≥32, different) or `JWT_*` pair, `DATABASE_URL` (non-sqlite), `PROVIDER_EGRESS_ALLOWLIST`, `WEBHOOK_EGRESS_ALLOWLIST`, `REDIS_URL` (redis://), `SECRETS_BACKEND=vault`, `VAULT_ADDR` (https), `HITL_EMAIL` (not `admin@example.com`), `ENCRYPT_LOGS_AT_REST=true`, `DATA_RETENTION_DAYS>0`, `REDIS_URL`, plus `ALLOWED_ORIGINS` (https, no wildcard). `SANDBOX_EXECUTION_ENABLED` requires `SANDBOX_RUNNER_COMMAND` or `false`.
+
+**Encryption key model (field-level, at rest):** ciphertext is versioned. Set `DATA_ENCRYPTION_KEY` (≥32) for the dedicated v2 key, independent of `SECRET_KEY` so signing secrets can rotate without touching stored data. Rows encrypted before `DATA_ENCRYPTION_KEY` existed (`enc:v1:`, derived from `SECRET_KEY`) remain readable, so enabling v2 is non-destructive. Decryption failures raise loudly — they are never masked with a placeholder.
+
+---
+
+## API surface
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| POST | `/api/v1/process` | user | Main gateway (idempotency via `Idempotency-Key`) |
+| POST | `/api/v1/process/stream` | user | Streaming SSE variant, same guards, hold-back PII scan |
+| GET | `/api/v1/config` | admin | Get provider/topic config (keys masked) |
+| POST | `/api/v1/config` | admin | Update provider/topic config |
+| GET | `/api/v1/policies` | admin | List policies |
+| POST | `/api/v1/policies` | admin | Update policies |
+| GET | `/api/v1/hitl/pending` | admin | Priority queue, tenant-scoped, SLA auto-escalated |
+| GET | `/api/v1/hitl/events` | admin | SSE live updates for HITL queue |
+| POST | `/api/v1/hitl/approve/{id}` | admin | Approve/deny one |
+| POST | `/api/v1/hitl/batch` | admin | Batch approve/deny |
+| POST | `/api/v1/hitl/escalate` | admin | Force SLA escalation check |
+| GET | `/api/v1/hitl/status/{id}` | admin | Single request details |
+| POST | `/api/v1/hitl/assign/{id}` | admin | Assign reviewer |
+| GET | `/api/v1/hitl/history` | admin | Tenant-scoped history |
+| GET | `/api/v1/monitoring/logs` | admin | Tenant-scoped logs |
+| GET | `/api/v1/monitoring/stats` | admin | Tenant-scoped aggregates |
+| GET | `/api/v1/monitoring/metrics` | admin | JSON or Prometheus (`?format=prometheus`) |
+| GET | `/api/v1/monitoring/alerts` | admin | Threshold alerts |
+| POST | `/api/v1/monitoring/incidents/export` | admin | Time-bounded export, tenant-filtered |
+| GET | `/api/v1/monitoring/circuit-breakers` | admin | CB states |
+| GET | `/api/v1/redteaming/payloads` | admin | Payload registry (when `REDTEAM_ENDPOINTS_ENABLED`) |
+| POST | `/api/v1/redteaming/scan` | admin | Run scanner (feeds learning loop) |
+| POST | `/api/v1/auth/token` | admin | Issue JWT |
+| POST | `/api/v1/auth/revoke` | admin | Revoke presented JWT (jti denylist) |
+| DELETE | `/api/v1/admin/tenants/{tenant_id}/data` | admin | Erase tenant data (retention/GDPR) |
+| GET | `/health` | — | Liveness |
+| GET | `/ready` | — | Readiness (DB + migrations) |
+
+---
+
+## Project structure
+
 ```
 src/
-├── gateway/          # Main API gateway
-├── filters/          # Input/output filters
-├── classifiers/      # AI-powered classifiers
-├── sandbox/          # Execution sandboxes
-├── monitoring/       # Logging and monitoring
-├── policy/           # Policy management
-├── hitl/            # Human-in-the-loop
-└── redteaming/      # Red teaming tools
+  gateway/       # router, idempotency, response_cache
+  filters/       # InputFilter (regex, DLP, corporate gate, topic lock)
+  classifiers/   # AI classifier, semantic detector, feedback_model
+  policy/        # PolicyManager (single source DEFAULT_POLICY_RULES)
+  hitl/          # HITL manager (priority, batch, SLA, resume)
+  monitoring/    # database models, logger, metrics, incident_export
+  providers/     # base, openai, anthropic, gemini, mock, circuit_breaker, retry, router_provider
+  queue/         # outbox (notifications + webhooks), notifications
+  auth/          # jwt_auth (jti revocation), rbac, tenant
+  secrets/       # secrets_manager, field_crypto (Fernet)
+  sandbox/       # sandbox_manager, sandbox_wrapper
+  config/        # settings (production gates)
+  static/        # dashboard SPA
+migrations/versions/  # Alembic (001..007)
+deploy/          # backup.sh / restore.sh
 ```
 
-### Testing
-```bash
-pytest tests/
-```
+---
 
-### Adding New Filters
-1. Create new filter class in `src/filters/`
-2. Implement required methods
-3. Register in main gateway
+## Limitations (honest)
 
-## Enterprise Features
+- **Detection is heuristic** (regex + TF-IDF + small toxicity model). Sophisticated paraphrase, multilingual, and Unicode tricks can bypass; embeddings + NER are the upgrade path (interface is pluggable).
+- **Multi-turn attacks** are not tracked — each request is stateless.
+- **SQLite** is fine locally but serializes writes; use Postgres for any real load (see compose).
+- **In-process rate limiting** is per-worker; Redis is used in production when `REDIS_URL` is set (fail-closed), otherwise in-process.
+- **Encryption at rest** is field-level Fernet with versioned keys: `enc:v1:` derived from `SECRET_KEY` (legacy), `enc:v2:` from the dedicated `DATA_ENCRYPTION_KEY`. Setting `DATA_ENCRYPTION_KEY` is non-destructive — legacy rows stay readable. Rotation still requires a re-encryption pass (same semantics as `006_encrypt_sensitive_data.py`); no Vault transit auto-rotation yet.
+- **History in git** still shows the pre-rotation API keys in commit `ef2876c` for ~90 days (GitHub GC). Rotate any reused credentials.
 
-- **Scalable Architecture**: Modular design for easy expansion
-- **Centralized Governance**: Single point of policy management
-- **Defense-in-Depth**: Multiple overlapping security layers
-- **AI-Enabled Detection**: Advanced threat detection using AI
-- **Risk Containment**: Sandboxing and access controls
-- **Transparency**: Comprehensive logging and audit trails
+---
 
 ## Contributing
 
-1. Fork the repository
-2. Create feature branch
-3. Add tests for new functionality
-4. Submit pull request
+1. Fork, branch, add tests
+2. `pytest -q` must be 104/104 (currently deterministic, mocked provider)
+3. PR
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+MIT — see `LICENSE`.
 
-## Security Notice
+## Security
 
-This is a security tool designed to protect AI systems. Use responsibly and in compliance with applicable laws and regulations.
+This is a *gateway* — prompts are still sent to the configured LLM provider and are subject to that provider's data policy. For sensitive data, use a self-hosted OpenAI-compatible endpoint (`custom` provider pointing at Ollama/vLLM) so prompts never leave your network.

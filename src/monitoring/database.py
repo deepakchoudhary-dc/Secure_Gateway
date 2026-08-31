@@ -4,9 +4,9 @@ Database module for AI Security Gateway -- Handles persistence of logs, policies
 
 import os
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, Text, DateTime, UniqueConstraint
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker, scoped_session
 from ..config.settings import settings
 
@@ -149,11 +149,12 @@ class OutboxEvent(Base):
     payload_json = Column(Text, nullable=False)
     status = Column(String(20), nullable=False, default="pending", index=True)
     attempts = Column(Integer, nullable=False, default=0)
-    available_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    available_at = Column(DateTime, nullable=False, default=datetime.now(timezone.utc), index=True)
     lease_expires_at = Column(DateTime, nullable=True, index=True)
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
     completed_at = Column(DateTime, nullable=True)
     last_error = Column(String(500), nullable=True)
+    tenant_id = Column(String(100), nullable=True, index=True)
 
 class IdempotencyRecord(Base):
     __tablename__ = "idempotency_records"

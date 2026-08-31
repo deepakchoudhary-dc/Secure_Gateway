@@ -8,7 +8,7 @@ redeploy. Benign approvals are stored for future allow-list / calibration use.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 
 from sqlalchemy import Column, DateTime, Integer, String, Text, func
@@ -43,7 +43,7 @@ def record_feedback(source: str, label: str, prompt: str, tenant_id: Optional[st
             label=label,
             prompt=encrypt_field(prompt[:10000]),
             tenant_id=tenant_id,
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
         ))
         session.commit()
     except Exception as exc:

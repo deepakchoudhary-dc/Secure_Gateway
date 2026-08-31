@@ -94,9 +94,12 @@ class TestHitlClosedLoop:
         ok = await mgr.approve_request(created["request_id"], approved=True, admin_name="Tester")
         assert ok is True
 
-        # Let the fire-and-forget resume task run to completion.
+        # Drive the outbox worker until the durable resume event is delivered
+        # and its result webhook appears.
+        from src.queue.outbox import deliver_next_notification
         for _ in range(200):
             await asyncio.sleep(0.05)
+            await deliver_next_notification()
             results = [
                 payload for payload in _pending_webhooks()
                 if payload.get("json", {}).get("type") == "hitl_result"

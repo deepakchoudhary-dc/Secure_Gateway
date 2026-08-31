@@ -11,9 +11,9 @@ import secrets
 from urllib.parse import urlparse
 from fastapi import APIRouter, HTTPException, Depends, Header, status, Response
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator, ValidationInfo
 from typing import Optional, List, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from sqlalchemy import text
 
 from ..filters.input_filter import get_input_filter
@@ -67,7 +67,7 @@ def get_provider_router() -> ProviderRouter:
 # Request and Response schemas
 class AIRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=settings.MAX_PROMPT_LENGTH)
-    system_prompt: Optional[str] = Field(None, max_length=4000)
+    system_prompt: Optional[str] = Field(None, max_length=4000, validate_default=True)
     retrieved_context: Optional[str] = Field(None, max_length=20000)
     user_id: Optional[str] = Field(None, min_length=1, max_length=100)
     # Free-form client context. Consumed by the HITL review dashboard
@@ -80,7 +80,7 @@ class AIRequest(BaseModel):
     callback_url: Optional[str] = Field(None, max_length=500)
     resume_on_approval: Optional[bool] = False
 
-    @validator("callback_url")
+    @field_validator("callback_url")
     def validate_callback_url(cls, value):
         if value is None:
             return value
@@ -89,13 +89,13 @@ class AIRequest(BaseModel):
             raise ValueError("callback_url must be an absolute http(s) URL")
         return value
 
-    @validator("resume_on_approval")
-    def validate_resume(cls, value, values):
-        if value and not values.get("callback_url"):
+    @field_validator("resume_on_approval")
+    def validate_resume(cls, value, info: ValidationInfo):
+        if value and not info.data.get("callback_url"):
             raise ValueError("resume_on_approval requires callback_url")
         return value
 
-    @validator("user_id")
+    @field_validator("user_id")
     def validate_user_id(cls, value):
         if value is None:
             return value
@@ -103,7 +103,7 @@ class AIRequest(BaseModel):
             raise ValueError("user_id contains invalid characters")
         return value
 
-    @validator("system_prompt", always=True)
+    @field_validator("system_prompt")
     def enforce_server_system_prompt(cls, value):
         if settings.ALLOW_CLIENT_SYSTEM_PROMPT:
             return value or settings.DEFAULT_SYSTEM_PROMPT
@@ -147,23 +147,23 @@ class GatewayConfigUpdate(BaseModel):
     fallback_model: str = Field(..., min_length=1, max_length=100)
     allowed_topics: str = Field("", max_length=500)
 
-    @validator("primary_provider", "fallback_provider")
+    @field_validator("primary_provider", "fallback_provider")
     def validate_provider(cls, value):
         if value not in {"openai", "anthropic", "gemini", "custom", "mock"}:
             raise ValueError("provider must be one of: openai, anthropic, gemini, custom, mock")
         return value
 
-    @validator("primary_url")
-    def validate_primary_url(cls, value, values):
-        if values.get("primary_provider") in {"mock", "gemini"} and not value:
+    @field_validator("primary_url")
+    def validate_primary_url(cls, value, info: ValidationInfo):
+        if info.data.get("primary_provider") in {"mock", "gemini"} and not value:
             return value
         if value:
             _validate_outbound_url(value)
         return value
 
-    @validator("fallback_url")
-    def validate_fallback_url(cls, value, values):
-        if values.get("fallback_provider") in {"mock", "gemini"} and not value:
+    @field_validator("fallback_url")
+    def validate_fallback_url(cls, value, info: ValidationInfo):
+        if info.data.get("fallback_provider") in {"mock", "gemini"} and not value:
             return value
         if value:
             _validate_outbound_url(value)
@@ -454,7 +454,7 @@ async def process_ai_request_impl(
     if not isinstance(current_user, CurrentUser):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Authenticated principal is required")
     # The optional body identity is never used for authorization, quotas, tenancy, or auditing.
-    request = request.copy(update={"user_id": current_user.subject})
+    request = request.model_copy(update={"user_id": current_user.subject})
     tenant_id = current_user.tenant_id
 
     idempotency_service = IdempotencyService()
@@ -462,7 +462,7 @@ async def process_ai_request_impl(
     if idempotency_key:
         try:
             valid_key = idempotency_service.validate_key(idempotency_key)
-            fingerprint = idempotency_service.fingerprint(request.dict())
+            fingerprint = idempotency_service.fingerprint(request.model_dump())
             claim, replayed = idempotency_service.claim_or_replay(
                 tenant_id=tenant_id,
                 subject=current_user.subject,
@@ -549,7 +549,7 @@ async def process_ai_request_impl(
         )
         if claim is not None:
             try:
-                idempotency_service.complete(claim, resp.dict())
+                idempotency_service.complete(claim, resp.model_dump())
             except Exception as comp_err:
                 logger.error("Failed to complete idempotency claim: %s", comp_err)
         return resp
@@ -747,7 +747,7 @@ async def process_ai_request_impl(
             security_score = 0.9
             response_text = sensitive_hit["reason"]
             # Never persist the sensitive payload itself.
-            request = request.copy(update={
+            request = request.model_copy(update={
                 "prompt": "[REDACTED: blocked for sensitive content]",
                 "retrieved_context": None,
                 "context": None,
@@ -1061,7 +1061,15 @@ async def revoke_token(authorization: Optional[str] = Header(default=None)):
         raise HTTPException(status_code=401, detail=str(exc))
     jti = claims.get("jti")
     if jti:
-        revoke_jti(jti)
+        exp = claims.get("exp")
+        expires_at = None
+        if exp:
+            try:
+                # exp is numeric timestamp from JWT
+                expires_at = datetime.fromtimestamp(int(exp), tz=timezone.utc).replace(tzinfo=None)
+            except Exception:
+                expires_at = None
+        revoke_jti(jti, expires_at=expires_at)
     return {"status": "success", "revoked": True}
 
 
@@ -1329,7 +1337,7 @@ async def get_dashboard_stats(current_user: CurrentUser = Depends(get_current_us
         # Get activity graph points (last 7 days)
         activity_points = []
         for i in range(6, -1, -1):
-            day_date = datetime.utcnow().date() - timedelta(days=i)
+            day_date = datetime.now(timezone.utc).date() - timedelta(days=i)
             day_str = day_date.strftime("%Y-%m-%d")
             
             day_start = datetime.combine(day_date, datetime.min.time())

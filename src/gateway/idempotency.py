@@ -12,7 +12,7 @@ import json
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Mapping, Optional
 
 from sqlalchemy.exc import IntegrityError
@@ -217,7 +217,15 @@ class IdempotencyService:
 
     @staticmethod
     def _is_expired(record: IdempotencyRecord, now: datetime) -> bool:
-        return bool(record.expires_at and record.expires_at <= now)
+        if not record.expires_at:
+            return False
+        # Handle naive vs aware comparison (DB stores naive, code now uses aware)
+        exp = record.expires_at
+        if exp.tzinfo is not None and now.tzinfo is None:
+            now = now.replace(tzinfo=exp.tzinfo)
+        elif exp.tzinfo is None and now.tzinfo is not None:
+            exp = exp.replace(tzinfo=now.tzinfo)
+        return exp <= now
 
     @staticmethod
     def _existing(

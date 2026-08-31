@@ -6,10 +6,11 @@ import json
 import logging
 import copy
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass
 from sqlalchemy import func
+from ..config.settings import settings
 from ..monitoring.database import SessionLocal, PolicyConfig, SecurityLog
 
 logger = logging.getLogger(__name__)
@@ -265,8 +266,35 @@ class PolicyManager:
 
         now = datetime.utcnow()
 
+        # Redis-backed distributed limiter when REDIS_URL is set; fail-closed in prod.
+        redis_url = getattr(settings, "REDIS_URL", "") or ""
+        if redis_url:
+            try:
+                import redis as _redis
+                _r = _redis.from_url(redis_url, decode_responses=True, socket_timeout=2)
+                minute_key = f"rl:{user_id}:m:{now.strftime('%Y%m%d%H%M')}"
+                hour_key = f"rl:{user_id}:h:{now.strftime('%Y%m%d%H')}"
+                # Use pipeline for atomic INCR + EXPIRE
+                pipe = _r.pipeline()
+                pipe.incr(minute_key)
+                pipe.expire(minute_key, 70)
+                pipe.incr(hour_key)
+                pipe.expire(hour_key, 3700)
+                minute_count, _, hour_count, _ = pipe.execute()
+                if int(minute_count) > rpm_limit:
+                    return {"allowed": False, "reason": f"Rate limit exceeded: maximum {rpm_limit} requests per minute."}
+                if int(hour_count) > rph_limit:
+                    return {"allowed": False, "reason": f"Rate limit exceeded: maximum {rph_limit} requests per hour."}
+                # Redis succeeded, skip in-memory and DB checks
+                return {"allowed": True}
+            except Exception as e:
+                if settings._is_production:
+                    logger.error(f"Redis unavailable in production, failing closed: {e}")
+                    return {"allowed": False, "reason": "Rate limiting temporarily unavailable."}
+                logger.warning(f"Redis unavailable, falling back to in-memory limiter: {e}")
+
         # Fast in-memory sliding-window check before hitting the database.
-        # ponytail: counts attempts (not outcomes) and is per-process — Redis token bucket if multi-node or stricter accounting is needed
+        # ponytail: per-process only — Redis above is used when available
         with PolicyManager._rate_lock:
             window = [t for t in PolicyManager._rate_windows.get(user_id, [])
                       if (now - t).total_seconds() < 3600]

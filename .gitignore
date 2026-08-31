@@ -41,4 +41,18 @@ htmlcov/
 
 audit.md
 
+# Agent runtime
+.agent/
 
+# Local agent instruction files
+*.md
+!README.md
+
+# Env template exception (the template IS meant to be committed)
+!.env.example
+
+# Local tooling / non-project items that must never be pushed
+skills/
+.reticle/
+.agents/
+*.png

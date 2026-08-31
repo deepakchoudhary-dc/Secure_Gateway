@@ -6,7 +6,7 @@ sensitive fields (prompts, responses) for safe sharing.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from ..monitoring.database import SessionLocal, SecurityLog

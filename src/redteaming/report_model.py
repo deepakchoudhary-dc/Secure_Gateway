@@ -5,7 +5,7 @@ Stores scan results separately from user traffic SecurityLogs
 to keep red-team data isolated for compliance.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import Column, DateTime, Float, Integer, String, Text
 

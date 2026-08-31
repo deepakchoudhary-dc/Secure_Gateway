@@ -14,7 +14,8 @@ services:
       WEBHOOK_EGRESS_ALLOWLIST: ${WEBHOOK_EGRESS_ALLOWLIST:?set WEBHOOK_EGRESS_ALLOWLIST}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?set ALLOWED_ORIGINS}
       HITL_EMAIL: ${HITL_EMAIL:?set HITL_EMAIL}
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
+      DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY:-}
       DATA_RETENTION_DAYS: ${DATA_RETENTION_DAYS:-90}
       LOG_FORMAT: json
     depends_on:
@@ -24,6 +25,12 @@ services:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     restart: unless-stopped
 
   migrate:
@@ -40,7 +47,8 @@ services:
       WEBHOOK_EGRESS_ALLOWLIST: ${WEBHOOK_EGRESS_ALLOWLIST:?set WEBHOOK_EGRESS_ALLOWLIST}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?set ALLOWED_ORIGINS}
       HITL_EMAIL: ${HITL_EMAIL:?set HITL_EMAIL}
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
+      DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY:-}
       DATA_RETENTION_DAYS: ${DATA_RETENTION_DAYS:-90}
     depends_on:
       db:
@@ -48,11 +56,13 @@ services:
 
   redis:
     image: redis:7-alpine
-    command: ["redis-server", "--save", "60", "1", "--appendonly", "yes"]
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD}", "--save", "60", "1", "--appendonly", "yes"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
     volumes:
       - redisdata:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep PONG"]
       interval: 10s
       timeout: 5s
       retries: 5

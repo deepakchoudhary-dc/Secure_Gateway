@@ -9,7 +9,7 @@ import logging
 import threading
 import time
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..config.settings import settings
@@ -80,12 +80,12 @@ class MetricsCollector:
         alert = {
             "type": alert_type,
             "message": message,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         with self._lock:
             # Deduplicate within the last 60 seconds
             recent = [a for a in self._alerts if a["type"] == alert_type
-                      and (datetime.utcnow() - datetime.fromisoformat(a["timestamp"])).total_seconds() < 60]
+                      and (datetime.now(timezone.utc) - datetime.fromisoformat(a["timestamp"])).total_seconds() < 60]
             if not recent:
                 self._alerts.append(alert)
                 logger.warning("ALERT [%s]: %s", alert_type, message)

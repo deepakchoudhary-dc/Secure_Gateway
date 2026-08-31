@@ -12,11 +12,12 @@ import asyncio
 import logging
 import uuid
 from typing import Dict, Any, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from ..config.settings import settings
-from ..monitoring.database import SessionLocal, HITLRequest
+from ..monitoring.database import SessionLocal, HITLRequest, OutboxEvent
 from ..queue.outbox import enqueue_notification, enqueue_webhook
 from ..classifiers.feedback_model import record_feedback
+from ..secrets.field_crypto import encrypt_json
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +70,7 @@ class HITLManager:
         try:
             sla_hours = int(getattr(settings, "HITL_SLA_HOURS", 4) or 4)
             if sla_hours > 0:
-                from datetime import timedelta
+                from datetime import timedelta, timezone
                 sla_deadline = datetime.utcnow() + timedelta(hours=sla_hours)
         except Exception:
             sla_deadline = None
@@ -241,18 +242,22 @@ class HITLManager:
                 session.close()
 
     async def approve_request(self, request_id: str, approved: bool, admin_name: str = "Admin") -> bool:
-        """Approve or deny a pending request.
-
-        Closes the loop: records a labeled sample for the learning system,
-        enqueues a durable webhook with the decision (if callback_url set),
-        and schedules automatic execution when resume_on_approval was requested.
-        """
+        """Approve or deny a pending request — atomic and durable."""
         session = SessionLocal()
         try:
-            db_req = session.query(HITLRequest).filter(HITLRequest.request_id == request_id).first()
-            if not (db_req and db_req.status == "pending"):
+            # Atomic compare-and-set: only pending can transition
+            updated = session.query(HITLRequest).filter(
+                HITLRequest.request_id == request_id,
+                HITLRequest.status == "pending"
+            ).update({
+                HITLRequest.status: "approved" if approved else "denied",
+                HITLRequest.decision_by: admin_name,
+                HITLRequest.decision_at: datetime.now(timezone.utc),
+            }, synchronize_session=False)
+            if updated == 0:
+                session.rollback()
                 return False
-
+            db_req = session.query(HITLRequest).filter(HITLRequest.request_id == request_id).first()
             snapshot = {
                 "request_id": db_req.request_id,
                 "prompt": db_req.prompt,
@@ -264,49 +269,51 @@ class HITLManager:
                 "callback_url": db_req.callback_url,
                 "resume_on_approval": bool(db_req.resume_on_approval),
             }
-
-            db_req.status = "approved" if approved else "denied"
-            db_req.decision_by = admin_name
-            db_req.decision_at = datetime.utcnow()
-
-            # Learning loop: the human decision is a labeled sample.
-            record_feedback(
-                source="hitl_denied" if not approved else "hitl_approved",
-                label="malicious" if not approved else "benign",
-                prompt=db_req.prompt,
-                tenant_id=db_req.tenant_id,
-            )
-
-            # Durable decision webhook via the notification outbox.
+            # Learning loop
+            try:
+                record_feedback(
+                    source="hitl_denied" if not approved else "hitl_approved",
+                    label="malicious" if not approved else "benign",
+                    prompt=db_req.prompt,
+                    tenant_id=db_req.tenant_id,
+                )
+            except Exception:
+                pass
             if snapshot["callback_url"]:
                 enqueue_webhook(session, snapshot["callback_url"], {
                     "type": "hitl_decision",
                     "request_id": request_id,
                     "approved": approved,
                     "decision_by": admin_name,
-                    "decided_at": datetime.utcnow().isoformat(),
-                })
-
+                    "decided_at": datetime.now(timezone.utc).isoformat(),
+                }, tenant_id=snapshot["tenant_id"])
+            # Durable resume: enqueue to outbox instead of fire-and-forget task
+            if approved and snapshot["resume_on_approval"] and snapshot["callback_url"]:
+                session.add(OutboxEvent(
+                    topic="hitl_resume",
+                    payload_json=encrypt_json(snapshot),
+                    status="pending",
+                    available_at=datetime.now(timezone.utc),
+                    tenant_id=snapshot["tenant_id"],
+                ))
             session.commit()
             logger.info(f"Request {request_id} manually {'approved' if approved else 'denied'} by {admin_name}")
-        except Exception as e:
+            return True
+        except Exception:
             session.rollback()
-            logger.error(f"Failed to approve request {request_id}: {e}")
+            logger.exception("Failed to approve request %s", request_id)
             return False
         finally:
             session.close()
 
-        # Auto-execute approved prompts that asked for resume (after commit).
-        if approved and snapshot["resume_on_approval"] and snapshot["callback_url"]:
-            asyncio.create_task(self._resume_and_notify(snapshot))
-        return True
-
-    async def _resume_and_notify(self, snap: Dict[str, Any]) -> None:
+    async def _resume_and_notify(self, snap: Dict[str, Any]) -> bool:
         """Re-run an approved request through the gateway and POST the result.
 
-        ponytail: best-effort in-process task — a crash between approval and
-        resume loses the run (decision webhook is still durable); upgrade path
-        is persisting resume jobs in the outbox table itself.
+        Invoked by the outbox worker for `hitl_resume` events, so a crash
+        between approval and resume no longer loses the run: the event is
+        retried with backoff and dead-letters after max attempts.
+        Returns True when the resume pipeline ran and the result webhook
+        was enqueued; False so the outbox retries.
         """
         try:
             from ..gateway.router import AIRequest, process_ai_request_impl  # local: circular import
@@ -324,10 +331,12 @@ class HITLManager:
             enqueue_webhook(None, snap["callback_url"], {
                 "type": "hitl_result",
                 "request_id": snap["request_id"],
-                "response": response.dict(),
-            })
+                "response": response.model_dump(),
+            }, tenant_id=snap.get("tenant_id"))
+            return True
         except Exception as exc:
-            logger.error("HITL resume failed for %s: %s", snap.get("request_id"), exc)
+            logger.exception("HITL resume failed for %s", snap.get("request_id"))
+            return False
 
     def assign_reviewer(self, request_id: str, reviewer: str) -> bool:
         """Assign a reviewer to a pending request."""

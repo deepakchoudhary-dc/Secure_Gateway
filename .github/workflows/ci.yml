@@ -13,11 +13,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-      - name: Install dependencies (test subset)
+          cache: pip
+      - name: Install dependencies (single source of truth: requirements.txt)
         run: |
-          pip install --no-cache-dir fastapi==0.104.1 uvicorn[standard]==0.24.0 \
-            pydantic==1.10.13 requests==2.31.0 sqlalchemy==2.0.23 alembic==1.13.1 \
-            "httpx>=0.24,<0.28" PyJWT pytest==7.4.3 pytest-asyncio==0.21.1 python-dotenv scikit-learn numpy cryptography
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir -r requirements.txt
+      - name: Dependency consistency check
+        run: pip check
+      - name: Apply database migrations
+        env:
+          APP_ENV: test
+          SECRET_KEY: ci-only-secret-key-0123456789abcdef0123456789abcdef
+          DATABASE_URL: sqlite:///./ci_migrations.db
+        run: python -m alembic upgrade head
       - name: Run tests
         env:
           APP_ENV: test
