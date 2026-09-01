@@ -112,7 +112,7 @@ class OpenAIProvider(LLMProvider):
         except ProviderError:
             raise
         except Exception as exc:
-            # ponytail: streaming fallback — if SSE fails, single complete still works
+            logger.warning("OpenAI streaming failed, falling back to non-streaming: %s", exc)
             yield from super().stream(messages, model, temperature, max_tokens, timeout)
 
     def validate_response(self, raw: Dict[str, Any]) -> None:

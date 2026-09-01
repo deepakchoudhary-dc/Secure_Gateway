@@ -893,7 +893,10 @@ async def process_ai_request_impl(
                 metrics.inc("response_cache_hits")
                 response_text = cached
                 add_trace("response_cache", "hit", {"key": rkey[:12]})
+                logger.debug("Response cache hit for key: %s", rkey[:12])
                 return finalize_response()
+            metrics.inc("response_cache_misses")
+            logger.debug("Response cache miss for key: %s", rkey[:12])
             provider_type = gw_config.primary_provider if gw_config else "mock"
             add_trace("model_routing", "selected", {
                 "provider": provider_type,
@@ -1412,6 +1415,19 @@ async def export_incident_endpoint(req: IncidentExportRequest):
 async def get_circuit_breaker_states():
     """Return current circuit breaker states for all providers."""
     return get_provider_router().get_circuit_states()
+
+
+@router.get("/monitoring/provider-health", dependencies=[_get_admin_dependency()])
+async def get_provider_health():
+    """Return health metrics for all LLM providers."""
+    return get_provider_router().get_provider_health()
+
+
+@router.get("/monitoring/cache-stats", dependencies=[_get_admin_dependency()])
+async def get_cache_stats():
+    """Return response cache statistics."""
+    from .response_cache import stats
+    return stats()
 
 
 # Red Teaming endpoints

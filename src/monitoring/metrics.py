@@ -131,6 +131,8 @@ class MetricsCollector:
             hitl = self._counters.get("requests_hitl", 0)
             failover = self._counters.get("requests_failover", 0)
             allowed = self._counters.get("requests_allowed", 0)
+            cache_hits = self._counters.get("response_cache_hits", 0)
+            cache_misses = self._counters.get("response_cache_misses", 0)
 
             durations = self._histograms.get("request_duration_seconds", [])
             avg_duration = sum(durations) / len(durations) if durations else 0.0
@@ -148,6 +150,9 @@ class MetricsCollector:
                 "active_hitl_pending": self._gauges.get("active_hitl_pending", 0),
                 "uptime_seconds": round(time.monotonic() - self._start_time, 1),
                 "alerts": self.get_alerts(10),
+                "response_cache_hits": cache_hits,
+                "response_cache_misses": cache_misses,
+                "cache_hit_rate": (cache_hits / (cache_hits + cache_misses)) if (cache_hits + cache_misses) > 0 else 0.0,
             }
 
     @staticmethod

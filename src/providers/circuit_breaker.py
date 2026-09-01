@@ -8,6 +8,7 @@ import logging
 import threading
 import time
 from enum import Enum
+from typing import Dict, Any
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,9 @@ class CircuitBreaker:
 
         self._state = CircuitState.CLOSED
         self._failure_count = 0
+        self._success_count = 0
         self._last_failure_time: float = 0
+        self._last_success_time: float = 0
         self._half_open_attempts = 0
         self._lock = threading.Lock()
 
@@ -50,16 +53,16 @@ class CircuitBreaker:
                 if time.monotonic() - self._last_failure_time >= self._cooldown_seconds:
                     self._state = CircuitState.HALF_OPEN
                     self._half_open_attempts = 0
-                    logger.info("Circuit %s transitioned OPEN → HALF_OPEN", self.name)
+                    logger.info("Circuit %s transitioned OPEN to HALF_OPEN", self.name)
             return self._state
 
     def check(self) -> None:
-        """Call before making a request.  Raises ``CircuitBreakerOpen`` if the circuit is open."""
+        """Call before making a request. Raises CircuitBreakerOpen if the circuit is open."""
         current = self.state
         if current == CircuitState.OPEN:
+            wait_time = self._cooldown_seconds - (time.monotonic() - self._last_failure_time)
             raise CircuitBreakerOpen(
-                f"Circuit breaker {self.name!r} is OPEN — calls blocked for "
-                f"{self._cooldown_seconds - (time.monotonic() - self._last_failure_time):.1f}s more"
+                f"Circuit breaker {self.name!r} is OPEN — calls blocked for {wait_time:.1f}s more"
             )
         if current == CircuitState.HALF_OPEN:
             with self._lock:
@@ -72,25 +75,27 @@ class CircuitBreaker:
     def record_success(self) -> None:
         """Record a successful call — resets the breaker to CLOSED."""
         with self._lock:
+            self._success_count += 1
+            self._last_success_time = time.monotonic()
             if self._state != CircuitState.CLOSED:
-                logger.info("Circuit %s → CLOSED (success)", self.name)
+                logger.info("Circuit %s transitioned to CLOSED (success)", self.name)
             self._state = CircuitState.CLOSED
             self._failure_count = 0
             self._half_open_attempts = 0
 
     def record_failure(self) -> None:
-        """Record a failed call.  Opens the circuit when the threshold is exceeded."""
+        """Record a failed call. Opens the circuit when the threshold is exceeded."""
         with self._lock:
             self._failure_count += 1
             self._last_failure_time = time.monotonic()
 
             if self._state == CircuitState.HALF_OPEN:
                 self._state = CircuitState.OPEN
-                logger.warning("Circuit %s → OPEN (half-open probe failed, count=%d)",
+                logger.warning("Circuit %s transitioned to OPEN (half-open probe failed, count=%d)",
                                self.name, self._failure_count)
             elif self._failure_count >= self._failure_threshold:
                 self._state = CircuitState.OPEN
-                logger.warning("Circuit %s → OPEN (failure threshold %d reached)",
+                logger.warning("Circuit %s transitioned to OPEN (failure threshold %d reached)",
                                self.name, self._failure_threshold)
 
     def reset(self) -> None:
@@ -98,15 +103,25 @@ class CircuitBreaker:
         with self._lock:
             self._state = CircuitState.CLOSED
             self._failure_count = 0
+            self._success_count = 0
             self._half_open_attempts = 0
             logger.info("Circuit %s manually reset to CLOSED", self.name)
 
-    def to_dict(self) -> dict:
-        """Serialise current state for observability endpoints."""
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize current state for observability endpoints."""
+        current_time = time.monotonic()
+        time_since_last_failure = current_time - self._last_failure_time if self._last_failure_time > 0 else 0
+        time_since_last_success = current_time - self._last_success_time if self._last_success_time > 0 else 0
+
         return {
             "name": self.name,
             "state": self.state.value,
             "failure_count": self._failure_count,
+            "success_count": self._success_count,
             "failure_threshold": self._failure_threshold,
             "cooldown_seconds": self._cooldown_seconds,
+            "half_open_attempts": self._half_open_attempts,
+            "half_open_max_attempts": self._half_open_max_attempts,
+            "time_since_last_failure_seconds": round(time_since_last_failure, 2),
+            "time_since_last_success_seconds": round(time_since_last_success, 2),
         }

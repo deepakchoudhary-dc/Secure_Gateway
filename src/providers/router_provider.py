@@ -13,6 +13,7 @@ uses to send requests to external LLM providers.  It encapsulates:
 import ipaddress
 import logging
 import socket
+import time
 from typing import Dict, List
 from urllib.parse import urlparse
 
@@ -24,6 +25,7 @@ from .openai_provider import OpenAIProvider
 from .anthropic_provider import AnthropicProvider
 from .gemini_provider import GeminiProvider
 from .retry import RetryBudgetExhausted, retry_with_backoff
+from .health_monitor import get_health_monitor
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,7 @@ class ProviderRouter:
         self._egress_allowlist = self._parse_allowlist(
             getattr(settings, "PROVIDER_EGRESS_ALLOWLIST", "")
         )
+        self._health_monitor = get_health_monitor()
 
     def _parse_allowlist(self, raw: str) -> List[str]:
         if not raw:
@@ -85,7 +88,6 @@ class ProviderRouter:
         provider = self._provider_cache.get(cache_key)
         if provider is None:
             provider = self.build_provider(provider_type, url, key, model)
-            # ponytail: clear-all on overflow — real deployments have a handful of configs
             if len(self._provider_cache) >= 32:
                 self._provider_cache.clear()
             self._provider_cache[cache_key] = provider
@@ -113,6 +115,7 @@ class ProviderRouter:
 
         primary = self.get_provider(primary_provider_type, primary_url, primary_key, primary_model)
         breaker = self._get_breaker(f"primary:{primary_provider_type}")
+        start_time = time.monotonic()
 
         try:
             breaker.check()
@@ -122,13 +125,18 @@ class ProviderRouter:
                 base_delay=self._base_delay,
                 budget_seconds=self._request_timeout * 2,
             )
+            latency_ms = (time.monotonic() - start_time) * 1000
             breaker.record_success()
+            self._health_monitor.record_request(primary_provider_type, True, latency_ms)
             return response
         except CircuitBreakerOpen as exc:
             logger.warning("Primary circuit open: %s", exc)
+            self._health_monitor.record_request(primary_provider_type, False, 0, str(exc))
         except (RetryBudgetExhausted, ProviderError) as exc:
             breaker.record_failure()
+            latency_ms = (time.monotonic() - start_time) * 1000
             logger.error("Primary provider failed: %s", exc)
+            self._health_monitor.record_request(primary_provider_type, False, latency_ms, str(exc))
 
         # ── Failover ──────────────────────────────────────────────
         if not fallback_enabled:
@@ -144,6 +152,7 @@ class ProviderRouter:
 
         fallback = self.get_provider(fallback_provider_type, fallback_url, fallback_key, fallback_model)
         fb_breaker = self._get_breaker(f"fallback:{fallback_provider_type}")
+        fallback_start_time = time.monotonic()
 
         try:
             fb_breaker.check()
@@ -153,13 +162,18 @@ class ProviderRouter:
                 base_delay=self._base_delay,
                 budget_seconds=self._request_timeout,
             )
+            latency_ms = (time.monotonic() - fallback_start_time) * 1000
             fb_breaker.record_success()
+            self._health_monitor.record_request(fallback_provider_type, True, latency_ms)
             response.provider = f"{fallback.name}(fallback)"
             return response
         except CircuitBreakerOpen as exc:
+            self._health_monitor.record_request(fallback_provider_type, False, 0, str(exc))
             raise ProviderError(f"Fallback circuit also open: {exc}", retryable=False)
         except (RetryBudgetExhausted, ProviderError) as exc:
+            latency_ms = (time.monotonic() - fallback_start_time) * 1000
             fb_breaker.record_failure()
+            self._health_monitor.record_request(fallback_provider_type, False, latency_ms, str(exc))
             raise ProviderError(
                 f"Both primary and fallback providers failed. Last: {exc}", retryable=False
             )
@@ -212,6 +226,10 @@ class ProviderRouter:
     def get_circuit_states(self) -> Dict[str, dict]:
         """Return current circuit breaker states for observability."""
         return {name: cb.to_dict() for name, cb in self._breakers.items()}
+
+    def get_provider_health(self) -> Dict[str, dict]:
+        """Return health metrics for all providers."""
+        return {name: metrics.to_dict() for name, metrics in self._health_monitor.get_all_health().items()}
 
 
 def assert_https_public_host(url: str) -> None:

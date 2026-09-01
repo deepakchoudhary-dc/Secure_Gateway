@@ -31,7 +31,6 @@ class MockProvider(LLMProvider):
         max_tokens: Optional[int] = None,
         timeout: float = 30.0,
     ):
-        # ponytail: chunk the canned response to exercise the streaming pipeline without network
         resp = self.complete(messages, model, temperature, max_tokens, timeout)
         chunk = 12
         for i in range(0, len(resp.content), chunk):
