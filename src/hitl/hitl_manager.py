@@ -26,8 +26,9 @@ class HITLManager:
     def __init__(self):
         self.approval_timeout = settings.HITL_APPROVAL_TIMEOUT_SECONDS
 
-    def _compute_priority(self, risk_score: float) -> int:
-        # ponytail: 4-tier priority from risk_score; per-request override via request_data.priority if provided
+    @staticmethod
+    def _compute_priority(risk_score: float) -> int:
+        # 4-tier priority from risk_score; per-request override via request_data.priority if provided
         if risk_score >= 0.85:
             return 3  # critical
         if risk_score >= 0.6:
@@ -399,44 +400,88 @@ class HITLManager:
     def batch_approve(self, request_ids: List[str], approved: bool, admin_name: str = "Admin") -> Dict[str, Any]:
         """Batch approve/deny multiple requests. Returns summary."""
         results = {"succeeded": [], "failed": [], "total": len(request_ids)}
-        # run sequentially to keep DB transactions simple
-        import asyncio
-        loop = None
+        now = datetime.utcnow()
+        session = SessionLocal()
         try:
-            loop = asyncio.get_event_loop()
-        except Exception:
-            loop = None
-        for rid in request_ids:
-            try:
-                # reuse approve_request logic synchronously via direct DB update for batch speed
-                session = SessionLocal()
+            for rid in request_ids:
                 try:
-                    db_req = session.query(HITLRequest).filter(HITLRequest.request_id == rid).first()
-                    if not (db_req and db_req.status == "pending"):
+                    updated = session.query(HITLRequest).filter(
+                        HITLRequest.request_id == rid,
+                        HITLRequest.status == "pending"
+                    ).update({
+                        HITLRequest.status: "approved" if approved else "denied",
+                        HITLRequest.decision_by: admin_name,
+                        HITLRequest.decision_at: now,
+                    }, synchronize_session=False)
+
+                    if updated == 0:
                         results["failed"].append({"id": rid, "reason": "not found or not pending"})
                         continue
-                    db_req.status = "approved" if approved else "denied"
-                    db_req.decision_by = admin_name
-                    db_req.decision_at = datetime.utcnow()
-                    # record feedback
-                    try:
-                        record_feedback(
-                            source="hitl_denied" if not approved else "hitl_approved",
-                            label="malicious" if not approved else "benign",
-                            prompt=db_req.prompt,
-                            tenant_id=db_req.tenant_id,
-                        )
-                    except Exception:
-                        pass
+
+                    db_req = session.query(HITLRequest).filter(HITLRequest.request_id == rid).first()
+                    if db_req:
+                        prompt_val = db_req.prompt
+                        tenant_id_val = db_req.tenant_id
+                        callback_url_val = db_req.callback_url
+                        resume_val = bool(db_req.resume_on_approval)
+                        model_val = db_req.model or "unknown"
+                        user_id_val = db_req.user_id or "unknown"
+                        sys_prompt_val = db_req.system_prompt
+                        context_val = db_req.retrieved_context
+
+                        # record feedback
+                        try:
+                            record_feedback(
+                                source="hitl_denied" if not approved else "hitl_approved",
+                                label="malicious" if not approved else "benign",
+                                prompt=prompt_val,
+                                tenant_id=tenant_id_val,
+                            )
+                        except Exception:
+                            pass
+
+                        # Webhook notification
+                        if callback_url_val:
+                            try:
+                                enqueue_webhook(session, callback_url_val, {
+                                    "type": "hitl_decision",
+                                    "request_id": rid,
+                                    "approved": approved,
+                                    "decision_by": admin_name,
+                                    "decided_at": now.isoformat(),
+                                }, tenant_id=tenant_id_val)
+                            except Exception:
+                                pass
+
+                        # Durable resume on approval
+                        if approved and resume_val and callback_url_val:
+                            snapshot = {
+                                "request_id": rid,
+                                "prompt": prompt_val,
+                                "system_prompt": sys_prompt_val,
+                                "retrieved_context": context_val,
+                                "model": model_val,
+                                "user_id": user_id_val,
+                                "tenant_id": tenant_id_val,
+                                "callback_url": callback_url_val,
+                                "resume_on_approval": resume_val,
+                            }
+                            session.add(OutboxEvent(
+                                topic="hitl_resume",
+                                payload_json=encrypt_json(snapshot),
+                                status="pending",
+                                available_at=now,
+                                tenant_id=tenant_id_val,
+                            ))
+
                     session.commit()
                     results["succeeded"].append(rid)
-                except Exception as e:
+                except Exception as item_err:
                     session.rollback()
-                    results["failed"].append({"id": rid, "reason": str(e)})
-                finally:
-                    session.close()
-            except Exception as e:
-                results["failed"].append({"id": rid, "reason": str(e)})
+                    logger.error(f"Batch approve DB error for {rid}: {item_err}")
+                    results["failed"].append({"id": rid, "reason": str(item_err)})
+        finally:
+            session.close()
         return results
 
     def escalate_overdue(self) -> List[str]:

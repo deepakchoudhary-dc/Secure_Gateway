@@ -63,6 +63,18 @@ const DOM = {
     hitlBatchDeny: document.getElementById('hitl-batch-deny'),
     hitlEscalateBtn: document.getElementById('hitl-escalate-btn'),
     hitlSseStatus: document.getElementById('hitl-sse-status'),
+    hitlTabPendingBtn: document.getElementById('hitl-tab-pending-btn'),
+    hitlTabHistoryBtn: document.getElementById('hitl-tab-history-btn'),
+    hitlTabPendingCount: document.getElementById('hitl-tab-pending-count'),
+    hitlPendingContainer: document.getElementById('hitl-pending-container'),
+    hitlHistoryContainer: document.getElementById('hitl-history-container'),
+    hitlHistoryTbody: document.getElementById('hitl-history-tbody'),
+    hitlRefreshHistoryBtn: document.getElementById('hitl-refresh-history-btn'),
+    hitlAssignInput: document.getElementById('hitl-assign-input'),
+    hitlAssignBtn: document.getElementById('hitl-assign-btn'),
+    hitlDetailRiskTag: document.getElementById('hitl-detail-risk-tag'),
+    circuitsGrid: document.getElementById('circuits-grid'),
+    refreshCircuitsBtn: document.getElementById('refresh-circuits-btn'),
     
     // Logs elements
     logsTbody: document.getElementById('logs-tbody'),
@@ -228,6 +240,7 @@ function switchTab(tabName) {
     } else if (tabName === 'policies') {
         renderActivePolicyForm();
     } else if (tabName === 'hitl') {
+        pollPendingHITL();
         loadHITLList();
     } else if (tabName === 'logs') {
         fetchLogs();
@@ -235,6 +248,7 @@ function switchTab(tabName) {
         fetchRedteamPayloads();
     } else if (tabName === 'integrations') {
         fetchConfig();
+        fetchCircuitBreakers();
     }
 }
 
@@ -631,36 +645,187 @@ async function saveActivePolicy() {
 function initHITL() {
     DOM.hitlApproveBtn.addEventListener('click', () => handleHITLDecision(true));
     DOM.hitlDenyBtn.addEventListener('click', () => handleHITLDecision(false));
+
+    // Batch operations
+    if (DOM.hitlSelectAll) {
+        DOM.hitlSelectAll.addEventListener('change', (e) => {
+            const checked = e.target.checked;
+            const reqs = Object.values(STATE.hitlRequests);
+            if (checked) {
+                reqs.forEach(r => STATE.selectedHitlIds.add(r.id));
+            } else {
+                STATE.selectedHitlIds.clear();
+            }
+            updateBatchButtons();
+            loadHITLList(false);
+        });
+    }
+
+    if (DOM.hitlBatchApprove) {
+        DOM.hitlBatchApprove.addEventListener('click', () => handleBatchDecision(true));
+    }
+    if (DOM.hitlBatchDeny) {
+        DOM.hitlBatchDeny.addEventListener('click', () => handleBatchDecision(false));
+    }
+    if (DOM.hitlEscalateBtn) {
+        DOM.hitlEscalateBtn.addEventListener('click', handleEscalateOverdue);
+    }
+    if (DOM.hitlAssignBtn) {
+        DOM.hitlAssignBtn.addEventListener('click', handleAssignReviewer);
+    }
+
+    // Tab Switching: Pending Queue vs Review History
+    if (DOM.hitlTabPendingBtn && DOM.hitlTabHistoryBtn) {
+        DOM.hitlTabPendingBtn.addEventListener('click', () => {
+            DOM.hitlTabPendingBtn.className = 'btn btn-sm btn-primary active';
+            DOM.hitlTabHistoryBtn.className = 'btn btn-sm btn-secondary';
+            if (DOM.hitlPendingContainer) DOM.hitlPendingContainer.style.display = 'grid';
+            if (DOM.hitlHistoryContainer) DOM.hitlHistoryContainer.style.display = 'none';
+        });
+
+        DOM.hitlTabHistoryBtn.addEventListener('click', () => {
+            DOM.hitlTabHistoryBtn.className = 'btn btn-sm btn-primary active';
+            DOM.hitlTabPendingBtn.className = 'btn btn-sm btn-secondary';
+            if (DOM.hitlPendingContainer) DOM.hitlPendingContainer.style.display = 'none';
+            if (DOM.hitlHistoryContainer) DOM.hitlHistoryContainer.style.display = 'block';
+            fetchHitlHistory();
+        });
+    }
+
+    if (DOM.hitlRefreshHistoryBtn) {
+        DOM.hitlRefreshHistoryBtn.addEventListener('click', fetchHitlHistory);
+    }
+
+    // Initialize SSE live stream
+    initHitlEventSource();
+}
+
+function initHitlEventSource() {
+    if (window.EventSource) {
+        try {
+            if (STATE.hitlEventSource) {
+                STATE.hitlEventSource.close();
+            }
+            STATE.hitlEventSource = new EventSource('/api/v1/hitl/events');
+            
+            STATE.hitlEventSource.onopen = () => {
+                if (DOM.hitlSseStatus) {
+                    DOM.hitlSseStatus.innerHTML = '<span style="color:var(--accent-green)">● live</span>';
+                }
+            };
+
+            STATE.hitlEventSource.onmessage = (e) => {
+                try {
+                    const data = JSON.parse(e.data);
+                    if (data && data.pending !== undefined) {
+                        STATE.hitlRequests = data.pending;
+                        const count = data.count !== undefined ? data.count : Object.keys(data.pending).length;
+                        updateHitlBadge(count);
+                        if (STATE.activeTab === 'hitl') {
+                            loadHITLList(false);
+                        }
+                    }
+                } catch (err) {
+                    console.debug("SSE parse error", err);
+                }
+            };
+
+            STATE.hitlEventSource.onerror = () => {
+                if (DOM.hitlSseStatus) {
+                    DOM.hitlSseStatus.innerHTML = '<span style="color:var(--accent-orange)">● reconnecting</span>';
+                }
+                // Fallback: poll every 3s if SSE drops
+                if (!STATE.hitlPollInterval) {
+                    STATE.hitlPollInterval = setInterval(pollPendingHITL, 3000);
+                }
+            };
+        } catch (err) {
+            console.warn("EventSource setup failed; falling back to polling", err);
+            setInterval(pollPendingHITL, 2000);
+        }
+    } else {
+        setInterval(pollPendingHITL, 2000);
+    }
+}
+
+function updateHitlBadge(count) {
+    if (count > 0) {
+        DOM.hitlBadge.innerText = count;
+        DOM.hitlBadge.style.display = 'block';
+    } else {
+        DOM.hitlBadge.style.display = 'none';
+    }
+    if (DOM.hitlTabPendingCount) {
+        DOM.hitlTabPendingCount.innerText = count;
+    }
 }
 
 async function pollPendingHITL() {
     try {
         const res = await fetch('/api/v1/hitl/pending');
         STATE.hitlRequests = await res.json();
-        
         const count = Object.keys(STATE.hitlRequests).length;
-        
-        // Update badge counts in menu sidebar
-        if (count > 0) {
-            DOM.hitlBadge.innerText = count;
-            DOM.hitlBadge.style.display = 'block';
-        } else {
-            DOM.hitlBadge.style.display = 'none';
-        }
+        updateHitlBadge(count);
 
         if (STATE.activeTab === 'hitl') {
-            loadHITLList();
+            loadHITLList(false);
         }
     } catch (e) {
         console.error("Failed to poll HITL pending requests", e);
     }
 }
 
-function loadHITLList() {
+function getPriorityBadgeHtml(priority) {
+    const p = parseInt(priority) || 0;
+    if (p >= 3) return `<span class="priority-badge p3"><i class="fa-solid fa-radiation"></i> Critical</span>`;
+    if (p === 2) return `<span class="priority-badge p2"><i class="fa-solid fa-triangle-exclamation"></i> High</span>`;
+    if (p === 1) return `<span class="priority-badge p1"><i class="fa-solid fa-circle-info"></i> Medium</span>`;
+    return `<span class="priority-badge p0">Low</span>`;
+}
+
+function updateBatchButtons() {
+    const count = STATE.selectedHitlIds.size;
+    if (DOM.hitlBatchApprove) {
+        DOM.hitlBatchApprove.disabled = count === 0;
+        DOM.hitlBatchApprove.innerHTML = `<i class="fa-solid fa-check-double"></i> Approve (${count})`;
+    }
+    if (DOM.hitlBatchDeny) {
+        DOM.hitlBatchDeny.disabled = count === 0;
+        DOM.hitlBatchDeny.innerHTML = `<i class="fa-solid fa-ban"></i> Deny (${count})`;
+    }
+    if (DOM.hitlSelectAll) {
+        const total = Object.keys(STATE.hitlRequests).length;
+        DOM.hitlSelectAll.checked = total > 0 && count === total;
+    }
+}
+
+function toggleHitlSelection(id, event) {
+    if (event) event.stopPropagation();
+    if (STATE.selectedHitlIds.has(id)) {
+        STATE.selectedHitlIds.delete(id);
+    } else {
+        STATE.selectedHitlIds.add(id);
+    }
+    updateBatchButtons();
+    loadHITLList(false);
+}
+
+function loadHITLList(autoSelectFirst = true) {
     const listContainer = DOM.hitlRequestsList;
-    const reqs = Object.values(STATE.hitlRequests);
+    let reqs = Object.values(STATE.hitlRequests);
+
+    // Sort: Priority descending (3 -> 0), then timestamp ascending
+    reqs.sort((a, b) => {
+        const pa = parseInt(a.priority) || 0;
+        const pb = parseInt(b.priority) || 0;
+        if (pb !== pa) return pb - pa;
+        return new Date(a.timestamp) - new Date(b.timestamp);
+    });
 
     DOM.hitlCountLabel.innerText = `${reqs.length} pending`;
+    if (DOM.hitlTabPendingCount) {
+        DOM.hitlTabPendingCount.innerText = reqs.length;
+    }
 
     if (reqs.length === 0) {
         listContainer.innerHTML = `
@@ -672,6 +837,8 @@ function loadHITLList() {
         `;
         DOM.hitlDetailView.style.display = 'none';
         STATE.activeHitlId = null;
+        STATE.selectedHitlIds.clear();
+        updateBatchButtons();
         return;
     }
 
@@ -679,28 +846,47 @@ function loadHITLList() {
     reqs.forEach(r => {
         const date = new Date(r.timestamp).toLocaleTimeString();
         const activeClass = STATE.activeHitlId === r.id ? 'active' : '';
-        
+        const isSelected = STATE.selectedHitlIds.has(r.id);
+        const priorityBadge = getPriorityBadgeHtml(r.priority);
+        const overdueBadge = r.is_overdue ? `<span class="sla-badge overdue"><i class="fa-solid fa-hourglass-end"></i> SLA Breach</span>` : '';
+        const escalatedBadge = r.is_escalated ? `<span class="sla-badge escalated"><i class="fa-solid fa-bolt"></i> Escalated</span>` : '';
+        const riskScore = typeof r.risk_score === 'number' ? r.risk_score.toFixed(2) : '0.00';
+
         html += `
             <div class="hitl-card ${activeClass}" onclick="selectHITLRequest('${r.id}')">
-                <div class="hitl-card-header">
-                    <span>User: ${escapeHtml(r.user_id)}</span>
-                    <time>${date}</time>
+                <div class="hitl-card-header" style="align-items: center;">
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <input type="checkbox" ${isSelected ? 'checked' : ''} onclick="toggleHitlSelection('${r.id}', event)">
+                        <span>${escapeHtml(r.user_id)}</span>
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 6px;">
+                        ${priorityBadge}
+                        ${overdueBadge}
+                        ${escalatedBadge}
+                        <time>${date}</time>
+                    </div>
+                </div>
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                    <small style="color:var(--text-muted); font-size:11px;">Model: <code>${escapeHtml(r.model || 'default')}</code></small>
+                    <span class="badge-risk ${r.risk_score > 0.75 ? 'high' : r.risk_score > 0.4 ? 'medium' : 'low'}">Risk ${riskScore}</span>
                 </div>
                 <p>${escapeHtml(r.prompt)}</p>
+                ${r.assigned_to ? `<div style="font-size:11px; color:var(--accent-blue); margin-top:4px;"><i class="fa-solid fa-user-check"></i> ${escapeHtml(r.assigned_to)}</div>` : ''}
             </div>
         `;
     });
 
     listContainer.innerHTML = html;
+    updateBatchButtons();
 
-    // If there is an active item but it's no longer in queue, hide detail view
+    // If active item is no longer in queue, deselect
     if (STATE.activeHitlId && !STATE.hitlRequests[STATE.activeHitlId]) {
         STATE.activeHitlId = null;
         DOM.hitlDetailView.style.display = 'none';
     }
 
-    // Auto-select the first request if none is selected
-    if (!STATE.activeHitlId && reqs.length > 0) {
+    // Auto-select first request if none is selected
+    if (autoSelectFirst && !STATE.activeHitlId && reqs.length > 0) {
         selectHITLRequest(reqs[0].id);
     }
 }
@@ -708,24 +894,35 @@ function loadHITLList() {
 window.selectHITLRequest = function(id) {
     STATE.activeHitlId = id;
     
-    // Highlight list card
+    // Highlight active card
     const cards = DOM.hitlRequestsList.querySelectorAll('.hitl-card');
-    cards.forEach(c => {
-        c.classList.remove('active');
-    });
+    cards.forEach(c => c.classList.remove('active'));
     
-    // Read list item details
     const req = STATE.hitlRequests[id];
     if (!req) return;
 
-    // Rerender details
+    // Show details
     DOM.hitlDetailView.style.display = 'flex';
     
+    // Update risk tag
+    if (DOM.hitlDetailRiskTag) {
+        const p = parseInt(req.priority) || 0;
+        DOM.hitlDetailRiskTag.innerText = p >= 3 ? 'Critical Priority' : p === 2 ? 'High Priority' : p === 1 ? 'Medium Priority' : 'Low Priority';
+        DOM.hitlDetailRiskTag.className = `risk-tag ${p >= 2 ? 'high' : p === 1 ? 'medium' : 'low'}`;
+    }
+
+    if (DOM.hitlAssignInput) {
+        DOM.hitlAssignInput.value = req.assigned_to || '';
+    }
+
     const formattedTime = new Date(req.timestamp).toLocaleString();
+    const slaInfo = req.sla_deadline ? new Date(req.sla_deadline).toLocaleString() : 'Not Set';
+    const riskScore = typeof req.risk_score === 'number' ? req.risk_score.toFixed(2) : '0.00';
+
     DOM.hitlDetailsBody.innerHTML = `
         <div class="detail-section">
-            <h4>Request Context prompt</h4>
-            <p>${escapeHtml(req.prompt)}</p>
+            <h4>Request Context Prompt</h4>
+            <blockquote style="background:var(--bg-input); padding:12px; border-radius:6px; border-left:3px solid var(--accent-blue); font-size:13px; line-height:1.5;">${escapeHtml(req.prompt)}</blockquote>
         </div>
         <div class="detail-meta-grid">
             <div class="meta-box">
@@ -733,12 +930,28 @@ window.selectHITLRequest = function(id) {
                 <strong><code>${escapeHtml(req.user_id)}</code></strong>
             </div>
             <div class="meta-box">
-                <span>Model Target</span>
+                <span>Target Model</span>
                 <strong><code>${escapeHtml(req.model)}</code></strong>
             </div>
             <div class="meta-box">
-                <span>System Timestamp</span>
+                <span>Risk Score</span>
+                <strong><span class="badge-risk ${req.risk_score > 0.75 ? 'high' : req.risk_score > 0.4 ? 'medium' : 'low'}">${riskScore}</span></strong>
+            </div>
+            <div class="meta-box">
+                <span>Priority Tier</span>
+                <strong>${getPriorityBadgeHtml(req.priority)}</strong>
+            </div>
+            <div class="meta-box">
+                <span>Submitted At</span>
                 <strong>${formattedTime}</strong>
+            </div>
+            <div class="meta-box">
+                <span>SLA Deadline</span>
+                <strong>${slaInfo} ${req.is_overdue ? '<span style="color:var(--accent-red); font-size:10px;">(BREACHED)</span>' : ''}</strong>
+            </div>
+            <div class="meta-box">
+                <span>Assigned Reviewer</span>
+                <strong>${escapeHtml(req.assigned_to || 'Unassigned')}</strong>
             </div>
             <div class="meta-box">
                 <span>Request ID</span>
@@ -748,11 +961,124 @@ window.selectHITLRequest = function(id) {
         ${req.context ? `
             <div class="detail-section" style="margin-top: 10px;">
                 <h4>Payload Metadata Context</h4>
-                <pre>${escapeHtml(req.context)}</pre>
+                <pre style="background:var(--bg-input); padding:10px; border-radius:6px; font-size:12px; overflow-x:auto;">${escapeHtml(req.context)}</pre>
             </div>
         ` : ''}
     `;
 };
+
+async function handleAssignReviewer() {
+    if (!STATE.activeHitlId || !DOM.hitlAssignInput) return;
+    const reviewer = DOM.hitlAssignInput.value.trim();
+    if (!reviewer) {
+        alert("Please enter a reviewer name or email.");
+        return;
+    }
+
+    try {
+        const res = await fetch(`/api/v1/hitl/assign/${STATE.activeHitlId}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ assigned_to: reviewer })
+        });
+        const data = await res.json();
+        if (data.status === 'success') {
+            if (STATE.hitlRequests[STATE.activeHitlId]) {
+                STATE.hitlRequests[STATE.activeHitlId].assigned_to = reviewer;
+            }
+            selectHITLRequest(STATE.activeHitlId);
+            loadHITLList(false);
+        } else {
+            alert(`Assignment failed: ${data.detail || 'Unknown error'}`);
+        }
+    } catch (err) {
+        console.error("Failed to assign reviewer", err);
+    }
+}
+
+async function handleBatchDecision(approved) {
+    const ids = Array.from(STATE.selectedHitlIds);
+    if (ids.length === 0) return;
+
+    try {
+        const res = await fetch('/api/v1/hitl/batch', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ request_ids: ids, approved: approved, admin_name: 'Admin Batch' })
+        });
+        const data = await res.json();
+        
+        ids.forEach(id => {
+            delete STATE.hitlRequests[id];
+            STATE.selectedHitlIds.delete(id);
+        });
+        STATE.activeHitlId = null;
+        updateBatchButtons();
+        pollPendingHITL();
+    } catch (e) {
+        console.error("Batch decision failed", e);
+    }
+}
+
+async function handleEscalateOverdue() {
+    try {
+        const res = await fetch('/api/v1/hitl/escalate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+        const data = await res.json();
+        if (data.count > 0) {
+            alert(`SLA Escalation: ${data.count} overdue requests escalated.`);
+        } else {
+            alert("No pending requests have breached SLA deadlines.");
+        }
+        pollPendingHITL();
+    } catch (e) {
+        console.error("SLA escalation failed", e);
+    }
+}
+
+async function fetchHitlHistory() {
+    if (!DOM.hitlHistoryTbody) return;
+    DOM.hitlHistoryTbody.innerHTML = `<tr><td colspan="8" class="table-empty">Loading history...</td></tr>`;
+
+    try {
+        const res = await fetch('/api/v1/hitl/history?limit=50');
+        const history = await res.json();
+
+        if (!Array.isArray(history) || history.length === 0) {
+            DOM.hitlHistoryTbody.innerHTML = `<tr><td colspan="8" class="table-empty">No completed review history found.</td></tr>`;
+            return;
+        }
+
+        let html = '';
+        history.forEach(h => {
+            const decidedDate = h.decision_at ? new Date(h.decision_at).toLocaleString() : 'N/A';
+            const statusBadge = h.status === 'approved' 
+                ? '<span class="badge-status allowed"><i class="fa-solid fa-check"></i> Approved</span>'
+                : '<span class="badge-status blocked"><i class="fa-solid fa-ban"></i> Denied</span>';
+            const priorityBadge = getPriorityBadgeHtml(h.priority);
+            const riskScore = typeof h.risk_score === 'number' ? h.risk_score.toFixed(2) : '0.00';
+
+            html += `
+                <tr>
+                    <td>${decidedDate}</td>
+                    <td><code>${escapeHtml(h.id)}</code></td>
+                    <td><code>${escapeHtml(h.user_id || 'anonymous')}</code></td>
+                    <td><code>${escapeHtml(h.model || 'default')}</code></td>
+                    <td>${priorityBadge}</td>
+                    <td><span class="badge-risk ${h.risk_score > 0.75 ? 'high' : h.risk_score > 0.4 ? 'medium' : 'low'}">${riskScore}</span></td>
+                    <td>${statusBadge}</td>
+                    <td>${escapeHtml(h.decision_by || 'Admin')} ${h.assigned_to ? `<small style="color:var(--text-muted);">(${escapeHtml(h.assigned_to)})</small>` : ''}</td>
+                </tr>
+            `;
+        });
+        DOM.hitlHistoryTbody.innerHTML = html;
+    } catch (err) {
+        console.error("Failed to fetch HITL history", err);
+        DOM.hitlHistoryTbody.innerHTML = `<tr><td colspan="8" class="table-empty" style="color:var(--accent-red);">Failed to load history.</td></tr>`;
+    }
+}
 
 async function handleHITLDecision(approved) {
     if (!STATE.activeHitlId) return;
@@ -769,11 +1095,10 @@ async function handleHITLDecision(approved) {
         const data = await res.json();
         
         if (data.status === 'success') {
-            // Remove locally and redraw
             delete STATE.hitlRequests[id];
+            STATE.selectedHitlIds.delete(id);
             STATE.activeHitlId = null;
-            
-            // Reload list and badge
+            updateBatchButtons();
             pollPendingHITL();
         } else {
             alert(`Approval failed: ${data.detail || 'Unknown error'}`);
@@ -1353,6 +1678,67 @@ function initIntegrations() {
             await saveConfig();
         });
     }
+    if (DOM.refreshCircuitsBtn) {
+        DOM.refreshCircuitsBtn.addEventListener('click', fetchCircuitBreakers);
+    }
+    fetchCircuitBreakers();
+}
+
+async function fetchCircuitBreakers() {
+    if (!DOM.circuitsGrid) return;
+
+    try {
+        const res = await fetch('/api/v1/monitoring/circuit-breakers');
+        const data = await res.json();
+        const breakers = data.circuit_breakers || data;
+
+        const names = Object.keys(breakers);
+        if (names.length === 0) {
+            DOM.circuitsGrid.innerHTML = `
+                <div class="circuit-card" style="grid-column: 1 / -1; text-align: center; color: var(--text-muted); padding: 20px;">
+                    <i class="fa-solid fa-shield-halved" style="font-size: 24px; margin-bottom: 8px; color: var(--accent-blue);"></i>
+                    <p>All provider circuit breakers are in initial healthy state (CLOSED).</p>
+                </div>
+            `;
+            return;
+        }
+
+        let html = '';
+        names.forEach(name => {
+            const cb = breakers[name];
+            const state = (cb.state || 'closed').toLowerCase();
+            const stateClass = state === 'open' ? 'open' : state === 'half_open' ? 'half_open' : 'closed';
+            const failCount = cb.failure_count || 0;
+            const threshold = cb.failure_threshold || 5;
+            const cooldown = cb.cooldown_seconds || 30;
+
+            html += `
+                <div class="circuit-card">
+                    <div class="circuit-card-header">
+                        <span class="circuit-card-title">${escapeHtml(name)}</span>
+                        <span class="circuit-state-badge ${stateClass}">${state.replace('_', ' ')}</span>
+                    </div>
+                    <div class="circuit-metrics-row">
+                        <span>Failure Counter</span>
+                        <strong>${failCount} / ${threshold}</strong>
+                    </div>
+                    <div class="circuit-metrics-row">
+                        <span>Cooldown Window</span>
+                        <strong>${cooldown}s</strong>
+                    </div>
+                    ${cb.last_failure_time ? `
+                        <div class="circuit-metrics-row">
+                            <span>Last Incident</span>
+                            <strong>${new Date(cb.last_failure_time * 1000).toLocaleTimeString()}</strong>
+                        </div>
+                    ` : ''}
+                </div>
+            `;
+        });
+        DOM.circuitsGrid.innerHTML = html;
+    } catch (err) {
+        console.error("Failed to fetch circuit breakers", err);
+    }
 }
 
 async function fetchConfig() {
@@ -1409,6 +1795,7 @@ async function saveConfig() {
             DOM.integrationsStatus.className = 'save-status success';
             DOM.integrationsStatus.innerText = 'Integrations updated successfully!';
             await fetchConfig();
+            await fetchCircuitBreakers();
         } else {
             DOM.integrationsStatus.className = 'save-status error';
             DOM.integrationsStatus.innerText = `Save failed: ${data.message || 'Unknown error'}`;

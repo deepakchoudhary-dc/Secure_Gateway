@@ -214,14 +214,10 @@ def test_provider_router_health_monitoring():
     # Access health monitor through router
     health = router.get_provider_health()
     assert isinstance(health, dict)
-    initial = health.get("openai", {}).get("total_requests", 0) if isinstance(health.get("openai"), dict) else 0
-    # Handle both dict and object forms
-    if isinstance(health.get("openai"), dict):
-        initial = health["openai"]["total_requests"]
-    elif hasattr(health.get("openai"), "total_requests"):
-        initial = health["openai"].total_requests
-    else:
-        initial = 0
+    initial = 0
+    if "openai" in health:
+        val = health["openai"]
+        initial = val["total_requests"] if isinstance(val, dict) else getattr(val, "total_requests", 0)
 
     # Record some metrics
     router._health_monitor.record_request("openai", success=True, latency_ms=200.0)

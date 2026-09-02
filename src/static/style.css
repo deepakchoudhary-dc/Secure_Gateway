@@ -1562,3 +1562,119 @@ input:checked + .slider:before {
     padding: 30px;
     backdrop-filter: blur(10px);
 }
+
+/* Priority & SLA Badges */
+.priority-badge {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 2px 7px;
+    border-radius: 4px;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+.priority-badge.p3 {
+    background-color: rgba(255, 59, 107, 0.2);
+    color: #ff3b6b;
+    border: 1px solid rgba(255, 59, 107, 0.4);
+    box-shadow: 0 0 8px rgba(255, 59, 107, 0.25);
+}
+.priority-badge.p2 {
+    background-color: rgba(255, 145, 0, 0.2);
+    color: #ff9100;
+    border: 1px solid rgba(255, 145, 0, 0.4);
+}
+.priority-badge.p1 {
+    background-color: rgba(0, 210, 255, 0.2);
+    color: #00d2ff;
+    border: 1px solid rgba(0, 210, 255, 0.4);
+}
+.priority-badge.p0 {
+    background-color: rgba(255, 255, 255, 0.08);
+    color: var(--text-muted);
+}
+
+.sla-badge {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 6px;
+    border-radius: 4px;
+    text-transform: uppercase;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+.sla-badge.overdue {
+    background-color: rgba(239, 68, 68, 0.2);
+    color: #f87171;
+    border: 1px solid rgba(239, 68, 68, 0.4);
+    animation: pulse-red 2s infinite;
+}
+.sla-badge.escalated {
+    background-color: rgba(217, 70, 239, 0.2);
+    color: #e879f9;
+    border: 1px solid rgba(217, 70, 239, 0.4);
+}
+
+@keyframes pulse-red {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
+}
+
+/* Circuit Breaker Cards */
+.circuit-card {
+    background: var(--bg-input);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    transition: var(--transition-fast);
+}
+.circuit-card:hover {
+    border-color: rgba(59, 130, 246, 0.4);
+}
+.circuit-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+.circuit-card-title {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--text-primary);
+}
+.circuit-state-badge {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 6px;
+    border-radius: 4px;
+    text-transform: uppercase;
+}
+.circuit-state-badge.closed {
+    background: rgba(0, 230, 118, 0.15);
+    color: var(--accent-green);
+    border: 1px solid rgba(0, 230, 118, 0.3);
+}
+.circuit-state-badge.open {
+    background: rgba(255, 59, 107, 0.2);
+    color: var(--accent-red);
+    border: 1px solid rgba(255, 59, 107, 0.4);
+}
+.circuit-state-badge.half_open {
+    background: rgba(255, 145, 0, 0.2);
+    color: var(--accent-orange);
+    border: 1px solid rgba(255, 145, 0, 0.4);
+}
+.circuit-metrics-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.circuit-metrics-row strong {
+    color: var(--text-primary);
+}
